@@ -21,13 +21,8 @@ def get_supabase_client():
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-@dataclass
-class ChangeRow:
-    id: int
-    source_id: int
-    url: str
-    old_snapshot_id: Optional[int]
-    new_snapshot_id: int
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _safe_first(data: Any) -> Optional[Dict[str, Any]]:
@@ -36,12 +31,39 @@ def _safe_first(data: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ---------------------------
+# Sources
+# ---------------------------
+
+def get_source_by_id(source_id: int) -> Optional[Dict[str, Any]]:
+    sb = get_supabase_client()
+    resp = (
+        sb.table("sources")
+        .select("id, name, url, source_type, priority, active")
+        .eq("id", int(source_id))
+        .limit(1)
+        .execute()
+    )
+    return _safe_first(resp.data)
+
+
+def get_source_url(source_id: int) -> str:
+    row = get_source_by_id(source_id)
+    if not row:
+        return ""
+    return row.get("url") or ""
+
+
+# ---------------------------
+# Snapshots
+# ---------------------------
+
 def get_snapshot_text_by_id(snapshot_id: int) -> str:
     sb = get_supabase_client()
     resp = (
         sb.table("snapshots")
         .select("clean_text")
-        .eq("id", snapshot_id)
+        .eq("id", int(snapshot_id))
         .limit(1)
         .execute()
     )
@@ -56,7 +78,7 @@ def get_snapshot_text_and_hash_by_id(snapshot_id: int) -> Tuple[str, str]:
     resp = (
         sb.table("snapshots")
         .select("clean_text, content_hash")
-        .eq("id", snapshot_id)
+        .eq("id", int(snapshot_id))
         .limit(1)
         .execute()
     )
@@ -64,30 +86,12 @@ def get_snapshot_text_and_hash_by_id(snapshot_id: int) -> Tuple[str, str]:
     return (row.get("clean_text") or "", row.get("content_hash") or "")
 
 
-def _get_source_url(source_id: int) -> str:
-    sb = get_supabase_client()
-    resp = (
-        sb.table("sources")
-        .select("url")
-        .eq("id", source_id)
-        .limit(1)
-        .execute()
-    )
-    row = _safe_first(resp.data)
-    if not row:
-        return ""
-    return row.get("url") or ""
-
-
 def get_latest_snapshot_for_source(source_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Returns latest snapshot row {id, content_hash, fetched_at} or None.
-    """
     sb = get_supabase_client()
     resp = (
         sb.table("snapshots")
         .select("id, content_hash, fetched_at")
-        .eq("source_id", source_id)
+        .eq("source_id", int(source_id))
         .order("fetched_at", desc=True)
         .limit(1)
         .execute()
@@ -96,13 +100,56 @@ def get_latest_snapshot_for_source(source_id: int) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------
-# Vector DB helpers (pgvector)
+# Changes
+# ---------------------------
+
+def get_pending_changes_for_triage(limit: int = 25) -> List[Dict[str, Any]]:
+    sb = get_supabase_client()
+    resp = (
+        sb.table("changes")
+        .select("id, source_id, prev_snapshot_id, new_snapshot_id, created_at, status")
+        .or_("status.is.null,status.eq.new,status.eq.pending")
+        .order("created_at", desc=True)
+        .limit(int(limit))
+        .execute()
+    )
+    return resp.data or []
+
+
+def update_change_triage_fields(
+    change_id: int,
+    status: str,
+    relevance_score: int,
+    local_risk_score: int,
+    tags: List[str],
+) -> None:
+    sb = get_supabase_client()
+    sb.table("changes").update(
+        {
+            "status": str(status),
+            "triaged_at": _utc_now_iso(),
+            "relevance_score": int(relevance_score),
+            "local_risk_score": int(local_risk_score),
+            "tags": tags,
+        }
+    ).eq("id", int(change_id)).execute()
+
+
+def mark_change_analyzed(change_id: int) -> None:
+    sb = get_supabase_client()
+    sb.table("changes").update(
+        {
+            "status": "analyzed",
+            "analyzed_at": _utc_now_iso(),
+        }
+    ).eq("id", int(change_id)).execute()
+
+
+# ---------------------------
+# Vector chunks (pgvector)
 # ---------------------------
 
 def upsert_vector_chunks(rows: List[Dict[str, Any]]) -> None:
-    """
-    Upserts chunk rows into vector_chunks. Requires UNIQUE(source_id, snapshot_sha, kind, chunk_index)
-    """
     if not rows:
         return
     sb = get_supabase_client()
@@ -118,9 +165,6 @@ def vector_search(
     filter_source_id: Optional[str] = None,
     filter_kind: Optional[str] = None,
 ):
-    """
-    Calls RPC match_vector_chunks(query_embedding, match_count, filter_source_id, filter_kind)
-    """
     sb = get_supabase_client()
     payload: Dict[str, Any] = {
         "query_embedding": query_embedding,
@@ -132,168 +176,158 @@ def vector_search(
 
 
 # ---------------------------
-# Insights pipeline helpers
+# Agent runs + audit
 # ---------------------------
 
-def get_uninsighted_changes(limit: int = 25) -> List[ChangeRow]:
+def create_agent_run(run_name: str, trigger: str, llm_backend: str) -> int:
     sb = get_supabase_client()
+    payload = {
+        "run_name": str(run_name),
+        "trigger": str(trigger),
+        "llm_backend": str(llm_backend),
+        "started_at": _utc_now_iso(),
+        "status": "running",
+        "stats": {},
+    }
+    resp = sb.table("agent_runs").insert(payload).execute()
+    row = _safe_first(resp.data) or {}
+    rid = int(row.get("id") or 0)
+    if rid <= 0:
+        raise RuntimeError("agent_runs insert did not return id")
+    return rid
 
-    changes_resp = (
-        sb.table("changes")
-        .select("id, source_id, prev_snapshot_id, new_snapshot_id, created_at")
+
+def finish_agent_run(run_id: int, status: str, stats: Dict[str, Any]) -> None:
+    sb = get_supabase_client()
+    sb.table("agent_runs").update(
+        {
+            "finished_at": _utc_now_iso(),
+            "status": str(status),
+            "stats": stats or {},
+        }
+    ).eq("id", int(run_id)).execute()
+
+
+def audit_log(
+    run_id: int,
+    agent_name: str,
+    action: str,
+    ref_type: str,
+    ref_id: int,
+    detail: Dict[str, Any],
+) -> None:
+    sb = get_supabase_client()
+    sb.table("agent_audit_log").insert(
+        {
+            "run_id": int(run_id),
+            "agent_name": str(agent_name),
+            "action": str(action),
+            "ref_type": str(ref_type),
+            "ref_id": int(ref_id),
+            "detail": detail or {},
+            "created_at": _utc_now_iso(),
+        }
+    ).execute()
+
+
+# ---------------------------
+# Agent events
+# ---------------------------
+
+def insert_agent_event(payload: Dict[str, Any]) -> int:
+    sb = get_supabase_client()
+    resp = sb.table("agent_events").insert(payload).execute()
+    row = _safe_first(resp.data) or {}
+    return int(row.get("id") or 0)
+
+
+def get_pending_agent_events(limit: int = 50) -> List[Dict[str, Any]]:
+    sb = get_supabase_client()
+    resp = (
+        sb.table("agent_events")
+        .select(
+            "id, source_id, snapshot_id, change_id, agent_name, event_type, title, summary, tags, relevance_score, local_risk_score, status, created_at"
+        )
+        .or_("status.is.null,status.eq.new,status.eq.pending")
         .order("created_at", desc=True)
-        .limit(max(limit * 3, limit))
+        .limit(int(limit))
         .execute()
     )
-
-    changes = changes_resp.data or []
-    if not changes:
-        return []
-
-    change_ids = [c["id"] for c in changes if c.get("id") is not None]
-    if not change_ids:
-        return []
-
-    insights_resp = (
-        sb.table("insights")
-        .select("change_id")
-        .in_("change_id", change_ids)
-        .execute()
-    )
-    existing = {
-        r["change_id"]
-        for r in (insights_resp.data or [])
-        if r.get("change_id") is not None
-    }
-
-    out: List[ChangeRow] = []
-    for c in changes:
-        cid = c.get("id")
-        if cid is None or cid in existing:
-            continue
-
-        source_id = c.get("source_id")
-        if source_id is None:
-            continue
-
-        new_snapshot_id = c.get("new_snapshot_id")
-        if new_snapshot_id is None:
-            continue
-
-        url = _get_source_url(int(source_id))
-
-        out.append(
-            ChangeRow(
-                id=int(cid),
-                source_id=int(source_id),
-                url=url,
-                old_snapshot_id=c.get("prev_snapshot_id"),
-                new_snapshot_id=int(new_snapshot_id),
-            )
-        )
-
-        if len(out) >= limit:
-            break
-
-    return out
+    return resp.data or []
 
 
-def create_baseline_changes(limit: int = 50) -> int:
+def mark_agent_events_processed(event_ids: List[int]) -> None:
+    if not event_ids:
+        return
     sb = get_supabase_client()
+    sb.table("agent_events").update(
+        {"status": "processed"}
+    ).in_("id", [int(x) for x in event_ids]).execute()
 
-    src_resp = sb.table("sources").select("id").limit(5000).execute()
-    sources = src_resp.data or []
-    if not sources:
-        return 0
 
-    source_ids = [int(s["id"]) for s in sources if s.get("id") is not None]
-    if not source_ids:
-        return 0
-
-    ch_resp = (
-        sb.table("changes")
-        .select("source_id")
-        .in_("source_id", source_ids)
-        .execute()
-    )
-    existing_sources = {
-        int(r["source_id"])
-        for r in (ch_resp.data or [])
-        if r.get("source_id") is not None
-    }
-
-    to_insert: List[Dict[str, Any]] = []
-    now = datetime.now(timezone.utc).isoformat()
-
-    for sid in source_ids:
-        if sid in existing_sources:
-            continue
-
-        snap_resp = (
-            sb.table("snapshots")
-            .select("id")
-            .eq("source_id", sid)
-            .order("fetched_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        row = _safe_first(snap_resp.data)
-        if not row or row.get("id") is None:
-            continue
-
-        snap_id = int(row["id"])
-
-        to_insert.append(
-            {
-                "source_id": sid,
-                "prev_snapshot_id": snap_id,
-                "new_snapshot_id": snap_id,
-                "diff_json": {"type": "baseline", "note": "Initial baseline for first-run briefing"},
-                "created_at": now,
-            }
-        )
-
-        if len(to_insert) >= limit:
-            break
-
-    if not to_insert:
-        return 0
-
-    sb.table("changes").insert(to_insert).execute()
-    return len(to_insert)
-
+# ---------------------------
+# Insights (includes source_id + snapshot_id)
+# ---------------------------
 
 def insert_insight(
     change_id: int,
+    source_id: int,
+    snapshot_id: int,
     agent_name: str,
     title: str,
     summary: str,
-    confidence: float = 0.6,
-    category: Optional[str] = None,
-    affected_signals: Optional[List[str]] = None,
-    recommended_actions: Optional[List[str]] = None,
-    risk_score: Optional[int] = None,
+    confidence: float,
+    category: Optional[str],
+    affected_signals: Optional[List[str]],
+    recommended_actions: Optional[List[str]],
+    risk_score: int,
 ) -> None:
     sb = get_supabase_client()
-
-    payload: Dict[str, Any] = {
+    payload = {
         "change_id": int(change_id),
-        "agent_name": agent_name,
-        "title": title,
-        "summary": summary,
+        "source_id": int(source_id),
+        "snapshot_id": int(snapshot_id),
+        "agent_name": str(agent_name),
+        "title": str(title)[:180],
+        "summary": str(summary)[:2000],
+        "category": (str(category)[:120] if category else None),
+        "affected_signals": affected_signals if affected_signals is not None else [],
+        "recommended_actions": recommended_actions if recommended_actions is not None else [],
         "confidence": float(confidence),
+        "risk_score": int(risk_score),
+        "created_at": _utc_now_iso(),
     }
+    sb.table("insights").insert(payload).execute()
 
-    if category is not None:
-        payload["category"] = str(category)
 
-    if affected_signals is not None:
-        payload["affected_signals"] = affected_signals
+# ---------------------------
+# Recommendations (matches your schema)
+# ---------------------------
 
-    if recommended_actions is not None:
-        payload["recommended_actions"] = recommended_actions
-
-    if risk_score is not None:
-        payload["risk_score"] = int(risk_score)
-
-    sb.table("insights").upsert(payload, on_conflict="change_id").execute()
+def insert_recommendation(
+    run_id: int,
+    title: str,
+    priority: str,
+    final_risk_score: int,
+    confidence: float,
+    event_ids: List[int],
+    change_ids: List[int],
+    rationale: str,
+    recommended_actions: List[str],
+    related_tags: List[str],
+) -> None:
+    sb = get_supabase_client()
+    payload = {
+        "run_id": int(run_id),
+        "title": str(title)[:180],
+        "priority": str(priority)[:8],  # P0 / P1 / P2
+        "final_risk_score": int(final_risk_score),
+        "confidence": float(confidence),
+        "event_ids": event_ids,
+        "change_ids": change_ids,
+        "rationale": str(rationale)[:4000],
+        "recommended_actions": recommended_actions[:10],
+        "related_tags": related_tags[:12],
+        "created_at": _utc_now_iso(),
+    }
+    sb.table("recommendations").insert(payload).execute()

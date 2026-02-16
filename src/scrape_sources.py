@@ -2,7 +2,7 @@
 import hashlib
 import re
 from datetime import datetime, timezone
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Dict, Any, List
 
 import requests
 from bs4 import BeautifulSoup
@@ -49,7 +49,7 @@ def _cap_text(text: str, max_chars: int) -> str:
         return text
     head = text[: int(max_chars * 0.7)]
     tail = text[-int(max_chars * 0.3) :]
-    return head.rstrip() + "\n\n[...truncated...]\n\n" + tail.lstrip()
+    return head.rstrip() + "\n\n[.truncated.]\n\n" + tail.lstrip()
 
 
 def fetch_raw_and_clean(url: str) -> Tuple[str, str]:
@@ -74,7 +74,8 @@ def fetch_raw_and_clean(url: str) -> Tuple[str, str]:
 
 
 def _store_vectors_for_snapshot(
-    source_id: str,
+    source_id_int: int,
+    snapshot_id: int,
     snapshot_sha: str,
     kind: str,
     clean_text: str,
@@ -88,12 +89,16 @@ def _store_vectors_for_snapshot(
     for i, (ch, emb) in enumerate(zip(chunks, embs)):
         rows.append(
             {
-                "source_id": str(source_id),
+                # existing fields
+                "source_id": str(source_id_int),
                 "snapshot_sha": str(snapshot_sha),
                 "kind": kind,
                 "chunk_index": int(i),
                 "chunk_text": ch,
                 "embedding": emb,
+                # new linkage fields
+                "source_id_int": int(source_id_int),
+                "snapshot_id": int(snapshot_id),
             }
         )
 
@@ -120,11 +125,10 @@ def main():
     embedded = 0
 
     for s in sources:
-        src_id = s["id"]
+        src_id = int(s["id"])
         name = s["name"]
         url = s["url"]
 
-        # Determine if this is a first snapshot (baseline) BEFORE inserting
         prev_latest = get_latest_snapshot_for_source(int(src_id))
         is_first_snapshot = prev_latest is None
 
@@ -148,19 +152,24 @@ def main():
             "clean_text": clean_text,
         }
 
-        # Insert snapshot
-        sb.table("snapshots").insert(payload).execute()
-        inserted += 1
-        print(f"Stored snapshot: {name}", flush=True)
+        # Insert snapshot and read back id
+        ins = sb.table("snapshots").insert(payload).execute()
+        row = (ins.data or [{}])[0]
+        snapshot_id = int(row.get("id") or 0)
+        if snapshot_id <= 0:
+            raise RuntimeError(f"Snapshot insert did not return id for source='{name}'")
 
-        # Embed baseline on first snapshot (optional), otherwise embed as snapshot
+        inserted += 1
+        print(f"Stored snapshot: {name} (snapshot_id={snapshot_id})", flush=True)
+
         if is_first_snapshot and not EMBED_BASELINE_ON_FIRST_SNAPSHOT:
             continue
 
         kind = "baseline" if is_first_snapshot else "snapshot"
         try:
             nvec = _store_vectors_for_snapshot(
-                source_id=str(src_id),
+                source_id_int=src_id,
+                snapshot_id=snapshot_id,
                 snapshot_sha=content_hash,
                 kind=kind,
                 clean_text=clean_text,
@@ -168,7 +177,6 @@ def main():
             embedded += nvec
             print(f"Embedded {nvec} chunks ({kind}): {name}", flush=True)
         except Exception as e:
-            # Do not fail the whole run if embeddings fail
             print(f"Vector embed failed for source='{name}': {e}", flush=True)
 
     print(f"✅ Done. inserted={inserted} skipped={skipped} embedded_chunks={embedded}", flush=True)

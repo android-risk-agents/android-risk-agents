@@ -19,10 +19,6 @@ def _utc_now_iso() -> str:
 
 
 def _delta_added_text(old_text: str, new_text: str, max_chars: int = 12000) -> str:
-    """
-    Simple delta: keep only added lines using ndiff.
-    Good enough for v1 "append changes" behavior.
-    """
     old_lines = (old_text or "").splitlines()
     new_lines = (new_text or "").splitlines()
 
@@ -36,12 +32,12 @@ def _delta_added_text(old_text: str, new_text: str, max_chars: int = 12000) -> s
         return ""
 
     if len(delta) > max_chars:
-        delta = delta[: int(max_chars * 0.8)] + "\n\n[...delta truncated...]\n\n" + delta[-int(max_chars * 0.2) :]
+        delta = delta[: int(max_chars * 0.8)] + "\n\n[.delta truncated.]\n\n" + delta[-int(max_chars * 0.2) :]
 
     return delta
 
 
-def _embed_delta(source_id: str, snapshot_sha: str, delta_text: str) -> int:
+def _embed_delta(source_id_int: int, snapshot_id: int, snapshot_sha: str, delta_text: str) -> int:
     chunks = chunk_text(delta_text, chunk_size_chars=CHUNK_SIZE_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS)
     if not chunks:
         return 0
@@ -51,12 +47,14 @@ def _embed_delta(source_id: str, snapshot_sha: str, delta_text: str) -> int:
     for i, (ch, emb) in enumerate(zip(chunks, embs)):
         rows.append(
             {
-                "source_id": str(source_id),
+                "source_id": str(source_id_int),
                 "snapshot_sha": str(snapshot_sha),
                 "kind": "delta",
                 "chunk_index": int(i),
                 "chunk_text": ch,
                 "embedding": emb,
+                "source_id_int": int(source_id_int),
+                "snapshot_id": int(snapshot_id),
             }
         )
 
@@ -77,10 +75,11 @@ def main():
     )
 
     for src in sources:
+        src_id = int(src["id"])
         snaps = (
             sb.table("snapshots")
             .select("id,content_hash,fetched_at")
-            .eq("source_id", src["id"])
+            .eq("source_id", src_id)
             .order("fetched_at", desc=True)
             .limit(2)
             .execute()
@@ -96,17 +95,17 @@ def main():
             continue
 
         payload = {
-            "source_id": src["id"],
-            "prev_snapshot_id": previous["id"],
-            "new_snapshot_id": latest["id"],
+            "source_id": src_id,
+            "prev_snapshot_id": int(previous["id"]),
+            "new_snapshot_id": int(latest["id"]),
             "diff_json": {
                 "prev_hash": previous["content_hash"],
                 "new_hash": latest["content_hash"],
             },
             "created_at": now,
+            "status": "new",
         }
 
-        # Requires UNIQUE constraint on (source_id, new_snapshot_id)
         sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
         print(f"🚨 Change detected for {src['name']}", flush=True)
 
@@ -119,10 +118,15 @@ def main():
             delta = _delta_added_text(old_text, new_text)
 
             if not delta:
-                print(f"No delta text extracted for {src['name']} (hash changed, but delta empty).", flush=True)
+                print(f"No delta text extracted for {src['name']} (hash changed, delta empty).", flush=True)
                 continue
 
-            nvec = _embed_delta(source_id=str(src["id"]), snapshot_sha=new_hash, delta_text=delta)
+            nvec = _embed_delta(
+                source_id_int=src_id,
+                snapshot_id=int(latest["id"]),
+                snapshot_sha=new_hash,
+                delta_text=delta,
+            )
             print(f"Embedded {nvec} delta chunks for {src['name']}", flush=True)
 
         except Exception as e:
