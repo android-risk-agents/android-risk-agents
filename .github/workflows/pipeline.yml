@@ -10,7 +10,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -58,12 +58,16 @@ jobs:
           EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
         run: python -m src.scrape_sources
 
-      - name: Detect changes (changes + delta embeddings)
+      - name: Detect changes (changes + delta embeddings + baseline-init changes)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
           EMBED_DELTAS_ON_CHANGE: "true"
+
+          # NEW: for first run demo - treat first snapshot as a change
+          INIT_BASELINE_AS_CHANGE: "true"
+          BASELINE_MAX_SOURCES: "10"
         run: python -m src.detect_changes
 
       - name: Sentinel triage agent (agent_events + change fields)

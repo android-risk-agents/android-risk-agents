@@ -13,6 +13,10 @@ from .db import (
 from .config import CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, EMBED_DELTAS_ON_CHANGE
 from .embedder import chunk_text, embed_texts
 
+# NEW: allow first snapshot to be treated as a change (for demo/run-1 recommendations)
+INIT_BASELINE_AS_CHANGE = (str(__import__("os").getenv("INIT_BASELINE_AS_CHANGE", "false")).lower() == "true")
+BASELINE_MAX_SOURCES = int(__import__("os").getenv("BASELINE_MAX_SOURCES", "10"))  # safety cap
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -57,7 +61,6 @@ def _embed_delta(source_id_int: int, snapshot_id: int, snapshot_sha: str, delta_
                 "snapshot_id": int(snapshot_id),
             }
         )
-
     upsert_vector_chunks(rows)
     return len(rows)
 
@@ -68,14 +71,19 @@ def main():
 
     sources = (
         sb.table("sources")
-        .select("id,name")
+        .select("id,name,priority")
         .eq("active", True)
+        .order("priority", desc=True)  # prioritize high priority first if you use it
         .execute()
         .data
     )
 
+    baseline_created = 0
+
     for src in sources:
         src_id = int(src["id"])
+        name = src["name"]
+
         snaps = (
             sb.table("snapshots")
             .select("id,content_hash,fetched_at")
@@ -86,9 +94,39 @@ def main():
             .data
         )
 
-        if len(snaps) < 2:
+        # 0 snapshots -> nothing to do
+        if not snaps:
             continue
 
+        # 1 snapshot only: optionally create a baseline-init "change"
+        if len(snaps) == 1:
+            if not INIT_BASELINE_AS_CHANGE:
+                continue
+
+            if baseline_created >= BASELINE_MAX_SOURCES:
+                print(f"Baseline-init cap reached ({BASELINE_MAX_SOURCES}). Skipping remaining.", flush=True)
+                break
+
+            latest = snaps[0]
+            payload = {
+                "source_id": src_id,
+                "prev_snapshot_id": None,
+                "new_snapshot_id": int(latest["id"]),
+                "diff_json": {
+                    "type": "baseline_init",
+                    "new_hash": latest["content_hash"],
+                },
+                "created_at": now,
+                "status": "new",
+            }
+
+            # uniqueness uses source_id,new_snapshot_id in your earlier code
+            sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
+            baseline_created += 1
+            print(f"🟦 Baseline-init change created for {name}", flush=True)
+            continue
+
+        # Normal case: have 2 snapshots
         latest, previous = snaps
 
         if latest["content_hash"] == previous["content_hash"]:
@@ -99,6 +137,7 @@ def main():
             "prev_snapshot_id": int(previous["id"]),
             "new_snapshot_id": int(latest["id"]),
             "diff_json": {
+                "type": "content_change",
                 "prev_hash": previous["content_hash"],
                 "new_hash": latest["content_hash"],
             },
@@ -107,7 +146,7 @@ def main():
         }
 
         sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
-        print(f"🚨 Change detected for {src['name']}", flush=True)
+        print(f"🚨 Change detected for {name}", flush=True)
 
         if not EMBED_DELTAS_ON_CHANGE:
             continue
@@ -118,7 +157,7 @@ def main():
             delta = _delta_added_text(old_text, new_text)
 
             if not delta:
-                print(f"No delta text extracted for {src['name']} (hash changed, delta empty).", flush=True)
+                print(f"No delta text extracted for {name} (hash changed, delta empty).", flush=True)
                 continue
 
             nvec = _embed_delta(
@@ -127,10 +166,12 @@ def main():
                 snapshot_sha=new_hash,
                 delta_text=delta,
             )
-            print(f"Embedded {nvec} delta chunks for {src['name']}", flush=True)
+            print(f"Embedded {nvec} delta chunks for {name}", flush=True)
 
         except Exception as e:
-            print(f"Delta embed failed for {src['name']}: {e}", flush=True)
+            print(f"Delta embed failed for {name}: {e}", flush=True)
+
+    print(f"✅ detect_changes done. baseline_init_created={baseline_created}", flush=True)
 
 
 if __name__ == "__main__":
