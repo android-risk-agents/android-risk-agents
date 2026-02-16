@@ -1,9 +1,7 @@
-name: Android Risk Agents Pipeline
+name: Android Risk Agents Pipeline (Agentic)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 14 * * *"  # daily at 14:00 UTC
 
 concurrency:
   group: android-risk-agents-pipeline
@@ -12,7 +10,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -23,7 +21,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ✅ Cache HuggingFace models (BIG speedup)
+      # Cache HuggingFace models (speedup)
       - name: Cache HF models
         uses: actions/cache@v4
         with:
@@ -33,10 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-
-          # Install CPU torch first (lighter + faster)
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-
           pip install -r requirements.txt
 
       - name: Seed sources (idempotent)
@@ -53,18 +48,17 @@ jobs:
           USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
         run: python -m src.discover_bulletins
 
-      - name: Scrape sources (embeddings created here)
+      - name: Scrape sources (snapshots + baseline embeddings)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
 
-          # vector settings
           VECTOR_DIM: "384"
           EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
         run: python -m src.scrape_sources
 
-      - name: Detect changes (delta embeddings here)
+      - name: Detect changes (changes + delta embeddings)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -72,13 +66,30 @@ jobs:
           EMBED_DELTAS_ON_CHANGE: "true"
         run: python -m src.detect_changes
 
-      - name: Generate insights (Groq + RAG)
+      - name: Sentinel triage agent (agent_events + change fields)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Groq now (OpenAI-compatible), GCP vLLM later
+          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LLM_BASE_URL: "https://api.groq.com/openai/v1"
+          MODEL_TRIAGE: "llama-3.1-8b-instant"
 
-          AGENT_NAME: "groq-demo"
+          AGENT_NAME: "sentinel-triage"
+          RELEVANCE_THRESHOLD: "70"
+        run: python -m src.agent_sentinel_triage
+
+      - name: Coordinator agent (recommendations + insights)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LLM_BASE_URL: "https://api.groq.com/openai/v1"
+          MODEL_ANALYZE: "llama-3.3-70b-versatile"
+
+          AGENT_NAME: "coordinator"
           RAG_TOP_K: "6"
-        run: python -m src.generate_insights_groq
+          MAX_RECOMMENDATIONS: "8"
+        run: python -m src.agent_coordinator
