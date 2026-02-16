@@ -107,7 +107,7 @@ def get_pending_changes_for_triage(limit: int = 25) -> List[Dict[str, Any]]:
     sb = get_supabase_client()
     resp = (
         sb.table("changes")
-        .select("id, source_id, prev_snapshot_id, new_snapshot_id, created_at, status")
+        .select("id, source_id, prev_snapshot_id, new_snapshot_id, diff_json, created_at, status")
         .or_("status.is.null,status.eq.new,status.eq.pending")
         .order("created_at", desc=True)
         .limit(int(limit))

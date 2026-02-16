@@ -1,6 +1,7 @@
 # src/detect_changes.py
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 import difflib
 from typing import List, Dict, Any
@@ -13,9 +14,9 @@ from .db import (
 from .config import CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, EMBED_DELTAS_ON_CHANGE
 from .embedder import chunk_text, embed_texts
 
-# NEW: allow first snapshot to be treated as a change (for demo/run-1 recommendations)
-INIT_BASELINE_AS_CHANGE = (str(__import__("os").getenv("INIT_BASELINE_AS_CHANGE", "false")).lower() == "true")
-BASELINE_MAX_SOURCES = int(__import__("os").getenv("BASELINE_MAX_SOURCES", "10"))  # safety cap
+# First-run demo: treat first snapshot as a "baseline init change"
+INIT_BASELINE_AS_CHANGE = os.getenv("INIT_BASELINE_AS_CHANGE", "false").lower() == "true"
+BASELINE_MAX_SOURCES = int(os.getenv("BASELINE_MAX_SOURCES", "10"))
 
 
 def _utc_now_iso() -> str:
@@ -73,7 +74,7 @@ def main():
         sb.table("sources")
         .select("id,name,priority")
         .eq("active", True)
-        .order("priority", desc=True)  # prioritize high priority first if you use it
+        .order("priority", desc=True)
         .execute()
         .data
     )
@@ -94,11 +95,10 @@ def main():
             .data
         )
 
-        # 0 snapshots -> nothing to do
         if not snaps:
             continue
 
-        # 1 snapshot only: optionally create a baseline-init "change"
+        # 1 snapshot only: baseline-init change (prev_snapshot_id = NULL)
         if len(snaps) == 1:
             if not INIT_BASELINE_AS_CHANGE:
                 continue
@@ -108,10 +108,12 @@ def main():
                 break
 
             latest = snaps[0]
+            latest_id = int(latest["id"])
+
             payload = {
                 "source_id": src_id,
-                "prev_snapshot_id": None,
-                "new_snapshot_id": int(latest["id"]),
+                "prev_snapshot_id": None,  # clean baseline init
+                "new_snapshot_id": latest_id,
                 "diff_json": {
                     "type": "baseline_init",
                     "new_hash": latest["content_hash"],
@@ -120,13 +122,12 @@ def main():
                 "status": "new",
             }
 
-            # uniqueness uses source_id,new_snapshot_id in your earlier code
             sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
             baseline_created += 1
             print(f"🟦 Baseline-init change created for {name}", flush=True)
             continue
 
-        # Normal case: have 2 snapshots
+        # Normal case: two snapshots exist
         latest, previous = snaps
 
         if latest["content_hash"] == previous["content_hash"]:

@@ -10,13 +10,14 @@ from .db import (
     get_snapshot_text_by_id,
     update_change_triage_fields,
     insert_agent_event,
+    get_source_url,
 )
 from .llm_client import get_llm_client, chat_json
 
 
 SYSTEM_TRIAGE = (
     "You are a Sentinel triage AI agent for a digital fraud risk team. "
-    "Given OLD vs NEW platform text, decide if this change is relevant to digital fraud risk monitoring. "
+    "Given OLD vs NEW platform text, decide if this update is relevant to digital fraud risk monitoring. "
     "Focus on platform capability changes, identity or device signals, policy enforcement, telemetry, SDK changes, and attacker opportunities. "
     "Be strict. Prefer false negatives if uncertain. "
     "Return ONLY valid JSON, no markdown."
@@ -44,18 +45,31 @@ def _as_tags(x: Any, max_items: int = 8) -> List[str]:
     return out
 
 
-def build_prompt(old_text: str, new_text: str, url: str) -> str:
+def _is_baseline_init(change_row: Dict[str, Any]) -> bool:
+    # Preferred: explicit marker
+    dj = change_row.get("diff_json") or {}
+    if isinstance(dj, dict) and str(dj.get("type", "")).lower() == "baseline_init":
+        return True
+    # Also treat NULL prev_snapshot_id as baseline init
+    return change_row.get("prev_snapshot_id") is None
+
+
+def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
     schema = {
         "is_relevant": "boolean",
         "relevance_score": "integer 0-100",
         "local_risk_score": "integer 0-100 (impact to fraud signals)",
-        "event_type": "string (policy_change | api_signal_change | security_update | enforcement_change | other)",
+        "event_type": "string (policy_change | api_signal_change | security_update | enforcement_change | baseline_init | other)",
         "title": "string (short)",
         "summary": "string (1-3 sentences, concrete)",
         "tags": ["string (short tags)"],
         "what_changed_hint": "string (short hint)",
     }
+
+    header = "BASELINE INITIAL INGESTION (no previous snapshot)" if baseline else "DIFF UPDATE (previous vs new)"
+
     return (
+        f"{header}\n"
         f"SOURCE: {url}\n\n"
         f"OLD (trimmed):\n{(old_text or '')[:4500]}\n\n"
         f"NEW (trimmed):\n{(new_text or '')[:4500]}\n\n"
@@ -67,10 +81,14 @@ def build_prompt(old_text: str, new_text: str, url: str) -> str:
 def main() -> int:
     agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
     threshold = int(os.getenv("RELEVANCE_THRESHOLD", "70"))
-    model = os.getenv("MODEL_TRIAGE", os.getenv("GROQ_MODEL_TRIAGE", "llama-3.1-8b-instant"))
+    model = os.getenv("MODEL_TRIAGE", "llama-3.1-8b-instant")
 
     client = get_llm_client()
-    run_id = create_agent_run(run_name="sentinel-triage", trigger="workflow_dispatch", llm_backend=os.getenv("LLM_BASE_URL", "default"))
+    run_id = create_agent_run(
+        run_name="sentinel-triage",
+        trigger="workflow_dispatch",
+        llm_backend=os.getenv("LLM_BASE_URL", "default"),
+    )
 
     stats = {"triaged": 0, "ignored": 0, "events_created": 0, "errors": 0}
 
@@ -83,32 +101,42 @@ def main() -> int:
         for ch in changes:
             change_id = int(ch["id"])
             source_id = int(ch["source_id"])
-            old_id = ch.get("prev_snapshot_id")
+            old_id = ch.get("prev_snapshot_id")  # may be None
             new_id = ch.get("new_snapshot_id")
 
-            old_text = get_snapshot_text_by_id(int(old_id)) if old_id else ""
+            baseline = _is_baseline_init(ch)
+
+            old_text = "" if baseline else (get_snapshot_text_by_id(int(old_id)) if old_id else "")
             new_text = get_snapshot_text_by_id(int(new_id)) if new_id else ""
 
-            url = f"source_id={source_id}"
+            url = get_source_url(source_id) or f"source_id={source_id}"
 
             try:
-                prompt = build_prompt(old_text, new_text, url)
+                prompt = build_prompt(old_text, new_text, url, baseline=baseline)
                 out = chat_json(
                     client=client,
                     model=model,
                     system=SYSTEM_TRIAGE,
                     user=prompt,
                     temperature=0.0,
-                    max_tokens=280,
+                    max_tokens=320,
                 )
 
                 is_rel = bool(out.get("is_relevant", False))
                 rel_score = _as_int(out.get("relevance_score", 0), 0)
                 local_risk = _as_int(out.get("local_risk_score", 0), 0)
                 tags = _as_tags(out.get("tags", []))
-                event_type = str(out.get("event_type", "other"))[:40]
-                title = str(out.get("title", "Update detected")).strip()[:120]
+                event_type = str(out.get("event_type", "baseline_init" if baseline else "other"))[:40]
+                title = str(out.get("title", "Baseline captured" if baseline else "Update detected")).strip()[:120]
                 summary = str(out.get("summary", "")).strip()[:900] or str(out.get("what_changed_hint", "")).strip()[:260]
+
+                # For baseline init, be demo-friendly
+                if baseline and rel_score == 0:
+                    rel_score = 75
+                if baseline and local_risk == 0:
+                    local_risk = 55
+                if baseline and event_type == "other":
+                    event_type = "baseline_init"
 
                 if (not is_rel) or (rel_score < threshold):
                     update_change_triage_fields(
@@ -124,7 +152,7 @@ def main() -> int:
                         action="triage_ignored",
                         ref_type="change",
                         ref_id=change_id,
-                        detail={"relevance_score": rel_score, "local_risk_score": local_risk, "tags": tags},
+                        detail={"relevance_score": rel_score, "local_risk_score": local_risk, "tags": tags, "baseline": baseline},
                     )
                     stats["ignored"] += 1
                     continue
@@ -149,20 +177,17 @@ def main() -> int:
                     "relevance_score": rel_score,
                     "local_risk_score": local_risk,
                     "status": "new",
-                    "created_at": None,  # let DB default if you set it; else remove None column in Supabase
                 }
-                # Remove created_at if your table auto-defaults and rejects null
-                if event_payload["created_at"] is None:
-                    event_payload.pop("created_at", None)
 
                 event_id = insert_agent_event(event_payload)
+
                 audit_log(
                     run_id=run_id,
                     agent_name=agent_name,
                     action="triage_event_created",
                     ref_type="agent_event",
                     ref_id=int(event_id or 0),
-                    detail={"change_id": change_id, "relevance_score": rel_score, "local_risk_score": local_risk, "tags": tags},
+                    detail={"change_id": change_id, "baseline": baseline},
                 )
 
                 stats["triaged"] += 1
