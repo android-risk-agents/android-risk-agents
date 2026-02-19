@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -28,3 +28,5 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+streamlit_app.py
