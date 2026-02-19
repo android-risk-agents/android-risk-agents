@@ -4,7 +4,6 @@ import os
 import json
 import time
 import random
-import re
 from json import JSONDecoder
 from typing import Dict, Any, Optional
 
@@ -13,19 +12,8 @@ import requests
 
 class NimClient:
     """
-    NIM OpenAI-compatible chat/completions client with hardened JSON extraction.
-
-    Fixes:
-    - JSONDecodeError: Extra data (multiple JSON objects / trailing text)
-    - Markdown fenced JSON blocks
-    - Random prefix/suffix text around JSON
-    - Transient network failures via retry + backoff
-
-    Env:
-    - NVIDIA_API_KEY (required)
-    - NIM_CHAT_URL (optional) default: https://integrate.api.nvidia.com/v1/chat/completions
-    - NIM_TIMEOUT_S (optional) default: 90
-    - NIM_RETRIES (optional) default: 3
+    Minimal NIM client that returns JSON dicts.
+    Hardcoded endpoint by default, only secret needed is NVIDIA_API_KEY.
     """
 
     def __init__(self):
@@ -33,7 +21,10 @@ class NimClient:
         if not self.api_key:
             raise RuntimeError("Missing NVIDIA_API_KEY")
 
-        self.base_url = os.getenv("NIM_CHAT_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+        # Hardcode NIM chat endpoint here (as discussed)
+        self.chat_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+        # Optional tuning knobs (can stay as defaults)
         self.timeout_s = int(os.getenv("NIM_TIMEOUT_S", "90"))
         self.retries = int(os.getenv("NIM_RETRIES", "3"))
 
@@ -43,9 +34,8 @@ class NimClient:
         system: str,
         user: str,
         temperature: float = 0.0,
-        max_tokens: int = 500,
+        max_tokens: int = 400,
     ) -> Dict[str, Any]:
-
         payload = {
             "model": model,
             "messages": [
@@ -66,7 +56,7 @@ class NimClient:
         for attempt in range(1, self.retries + 1):
             try:
                 resp = requests.post(
-                    self.base_url,
+                    self.chat_url,
                     json=payload,
                     headers=headers,
                     timeout=self.timeout_s,
@@ -76,7 +66,6 @@ class NimClient:
                     raise RuntimeError(f"NIM error {resp.status_code}: {resp.text[:1200]}")
 
                 data = resp.json()
-
                 content = (
                     data.get("choices", [{}])[0]
                     .get("message", {})
@@ -90,7 +79,6 @@ class NimClient:
                 if attempt >= self.retries:
                     break
 
-                # exponential backoff + jitter
                 sleep_s = min(10.0, 1.5 * (2 ** (attempt - 1)))
                 sleep_s *= (0.85 + random.random() * 0.3)
                 time.sleep(sleep_s)
@@ -103,45 +91,39 @@ class NimClient:
         if "```" not in t:
             return t
 
-        # Prefer a fenced block that contains JSON braces
         parts = t.split("```")
         for p in parts:
             p2 = p.strip()
             if "{" in p2 and "}" in p2:
-                # Remove a leading 'json' token if present
                 if p2.lower().startswith("json"):
                     p2 = p2[4:].strip()
                 return p2
 
-        # fallback: remove literal fences
         return t.replace("```json", "").replace("```", "").strip()
 
     @classmethod
     def _extract_json_only(cls, text: str) -> Dict[str, Any]:
         """
-        Robustly parse the FIRST JSON object from the model output.
-        Avoids 'Extra data' by using JSONDecoder.raw_decode.
+        Parses the FIRST JSON object found (avoids JSONDecodeError: Extra data).
         """
         t = cls._strip_fences(text)
 
-        # Fast path: strict JSON
         try:
             obj = json.loads(t)
             if not isinstance(obj, dict):
-                raise ValueError("Expected a top-level JSON object")
+                raise ValueError("Expected top-level JSON object")
             return obj
         except Exception:
             pass
 
-        # Find the first '{' and parse the first JSON object only
         start = t.find("{")
         if start == -1:
             raise ValueError(f"No JSON object found in model output: {t[:300]}")
 
         decoder = JSONDecoder()
-        obj, _end = decoder.raw_decode(t[start:])
+        obj, _ = decoder.raw_decode(t[start:])
 
         if not isinstance(obj, dict):
-            raise ValueError("Expected a top-level JSON object")
+            raise ValueError("Expected top-level JSON object")
 
         return obj
