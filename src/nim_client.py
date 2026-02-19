@@ -2,17 +2,40 @@ from __future__ import annotations
 
 import os
 import json
+import time
+import random
+import re
+from json import JSONDecoder
+from typing import Dict, Any, Optional
+
 import requests
-from typing import Dict, Any, List
 
 
 class NimClient:
+    """
+    NIM OpenAI-compatible chat/completions client with hardened JSON extraction.
+
+    Fixes:
+    - JSONDecodeError: Extra data (multiple JSON objects / trailing text)
+    - Markdown fenced JSON blocks
+    - Random prefix/suffix text around JSON
+    - Transient network failures via retry + backoff
+
+    Env:
+    - NVIDIA_API_KEY (required)
+    - NIM_CHAT_URL (optional) default: https://integrate.api.nvidia.com/v1/chat/completions
+    - NIM_TIMEOUT_S (optional) default: 90
+    - NIM_RETRIES (optional) default: 3
+    """
+
     def __init__(self):
         self.api_key = os.getenv("NVIDIA_API_KEY")
         if not self.api_key:
             raise RuntimeError("Missing NVIDIA_API_KEY")
 
-        self.base_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        self.base_url = os.getenv("NIM_CHAT_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+        self.timeout_s = int(os.getenv("NIM_TIMEOUT_S", "90"))
+        self.retries = int(os.getenv("NIM_RETRIES", "3"))
 
     def chat_json(
         self,
@@ -29,8 +52,8 @@ class NimClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
         }
 
         headers = {
@@ -38,35 +61,87 @@ class NimClient:
             "Content-Type": "application/json",
         }
 
-        resp = requests.post(self.base_url, json=payload, headers=headers, timeout=90)
+        last_err: Optional[Exception] = None
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"NIM error {resp.status_code}: {resp.text}")
+        for attempt in range(1, self.retries + 1):
+            try:
+                resp = requests.post(
+                    self.base_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout_s,
+                )
 
-        data = resp.json()
+                if resp.status_code != 200:
+                    raise RuntimeError(f"NIM error {resp.status_code}: {resp.text[:1200]}")
 
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+                data = resp.json()
 
-        return self._extract_json_only(content)
+                content = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+
+                return self._extract_json_only(content)
+
+            except Exception as e:
+                last_err = e
+                if attempt >= self.retries:
+                    break
+
+                # exponential backoff + jitter
+                sleep_s = min(10.0, 1.5 * (2 ** (attempt - 1)))
+                sleep_s *= (0.85 + random.random() * 0.3)
+                time.sleep(sleep_s)
+
+        raise RuntimeError(f"NIM request failed after {self.retries} attempts: {last_err}") from last_err
 
     @staticmethod
-    def _extract_json_only(text: str) -> Dict[str, Any]:
-        text = (text or "").strip()
+    def _strip_fences(text: str) -> str:
+        t = (text or "").strip()
+        if "```" not in t:
+            return t
 
-        if text.startswith("```"):
-            parts = text.split("```")
-            if len(parts) >= 2:
-                text = parts[1].replace("json", "", 1).strip()
+        # Prefer a fenced block that contains JSON braces
+        parts = t.split("```")
+        for p in parts:
+            p2 = p.strip()
+            if "{" in p2 and "}" in p2:
+                # Remove a leading 'json' token if present
+                if p2.lower().startswith("json"):
+                    p2 = p2[4:].strip()
+                return p2
 
+        # fallback: remove literal fences
+        return t.replace("```json", "").replace("```", "").strip()
+
+    @classmethod
+    def _extract_json_only(cls, text: str) -> Dict[str, Any]:
+        """
+        Robustly parse the FIRST JSON object from the model output.
+        Avoids 'Extra data' by using JSONDecoder.raw_decode.
+        """
+        t = cls._strip_fences(text)
+
+        # Fast path: strict JSON
         try:
-            return json.loads(text)
+            obj = json.loads(t)
+            if not isinstance(obj, dict):
+                raise ValueError("Expected a top-level JSON object")
+            return obj
         except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1:
-                raise
-            return json.loads(text[start:end + 1])
+            pass
+
+        # Find the first '{' and parse the first JSON object only
+        start = t.find("{")
+        if start == -1:
+            raise ValueError(f"No JSON object found in model output: {t[:300]}")
+
+        decoder = JSONDecoder()
+        obj, _end = decoder.raw_decode(t[start:])
+
+        if not isinstance(obj, dict):
+            raise ValueError("Expected a top-level JSON object")
+
+        return obj

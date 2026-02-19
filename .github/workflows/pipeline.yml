@@ -27,6 +27,8 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            hf-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
@@ -71,18 +73,16 @@ jobs:
         run: python -m src.detect_changes
 
       # -----------------------------
-      # Agent Layer
+      # Agent Layer (NIM hardcoded in code)
       # -----------------------------
 
       - name: Sentinel triage agent
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
-          MODEL_TRIAGE: "meta/llama3-8b-instruct"
-
+          # agent controls only (LLM URL/model hardcoded in code)
           AGENT_NAME: "sentinel-triage"
           RELEVANCE_THRESHOLD: "60"
         run: python -m src.agent_sentinel_triage
@@ -91,11 +91,9 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
-          MODEL_ANALYZE: "meta/llama3-8b-instruct"
-
+          # agent controls only (LLM URL/model hardcoded in code)
           AGENT_NAME: "coordinator"
           RAG_TOP_K: "6"
           MAX_RECOMMENDATIONS: "8"
