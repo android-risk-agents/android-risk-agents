@@ -21,7 +21,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Cache HuggingFace models (speedup)
       - name: Cache HF models
         uses: actions/cache@v4
         with:
@@ -34,7 +33,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Seed sources (idempotent)
+      - name: Seed sources
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -48,50 +47,45 @@ jobs:
           USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
         run: python -m src.discover_bulletins
 
-      - name: Scrape sources (snapshots + baseline embeddings)
+      - name: Scrape sources
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
-
           VECTOR_DIM: "384"
           EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
         run: python -m src.scrape_sources
 
-      - name: Detect changes (changes + delta embeddings + baseline-init changes)
+      - name: Detect changes
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
           EMBED_DELTAS_ON_CHANGE: "true"
-
-          # NEW: for first run demo - treat first snapshot as a change
           INIT_BASELINE_AS_CHANGE: "true"
           BASELINE_MAX_SOURCES: "10"
         run: python -m src.detect_changes
 
-      - name: Sentinel triage agent (agent_events + change fields)
+      - name: Sentinel triage agent
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          # Groq now (OpenAI-compatible), GCP vLLM later
-          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          LLM_BASE_URL: "https://api.groq.com/openai/v1"
-          MODEL_TRIAGE: "llama-3.1-8b-instant"
+          NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
+
+          MODEL_TRIAGE: "meta/llama3-8b-instruct"
 
           AGENT_NAME: "sentinel-triage"
-          RELEVANCE_THRESHOLD: "70"
+          RELEVANCE_THRESHOLD: "60"
         run: python -m src.agent_sentinel_triage
 
-      - name: Coordinator agent (recommendations + insights)
+      - name: Coordinator agent
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          LLM_BASE_URL: "https://api.groq.com/openai/v1"
-          MODEL_ANALYZE: "llama-3.3-70b-versatile"
+          NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
+
+          MODEL_ANALYZE: "meta/llama3-8b-instruct"
 
           AGENT_NAME: "coordinator"
           RAG_TOP_K: "6"

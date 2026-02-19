@@ -1,5 +1,5 @@
-#testing permission for owner
 # src/agent_sentinel_triage.py
+
 import os
 from typing import Any, Dict, List
 
@@ -13,15 +13,23 @@ from .db import (
     insert_agent_event,
     get_source_url,
 )
-from .llm_client import get_llm_client, chat_json
+
+from .nim_client import NimClient
 
 
 SYSTEM_TRIAGE = (
-    "You are a Sentinel triage AI agent for a digital fraud risk team. "
-    "Given OLD vs NEW platform text, decide if this update is relevant to digital fraud risk monitoring. "
-    "Focus on platform capability changes, identity or device signals, policy enforcement, telemetry, SDK changes, and attacker opportunities. "
-    "Be strict. Prefer false negatives if uncertain. "
-    "Return ONLY valid JSON, no markdown."
+    "You are a Sentinel triage AI agent for Android ecosystem fraud monitoring.\n"
+    "Your role is to detect Android platform updates that could impact digital fraud detection systems.\n\n"
+    "Pay special attention to:\n"
+    "- Play Integrity API / SafetyNet changes\n"
+    "- Device identifiers or telemetry restrictions\n"
+    "- Permission model changes\n"
+    "- SDK or API capability updates\n"
+    "- Policy enforcement or app review changes\n"
+    "- Signal removals or new anti-abuse protections\n"
+    "- Security bulletins, CVEs, exploitability risk\n\n"
+    "If unsure, prefer mild relevance rather than strict rejection.\n"
+    "Return ONLY valid JSON."
 )
 
 
@@ -47,62 +55,70 @@ def _as_tags(x: Any, max_items: int = 8) -> List[str]:
 
 
 def _is_baseline_init(change_row: Dict[str, Any]) -> bool:
-    # Preferred: explicit marker
     dj = change_row.get("diff_json") or {}
     if isinstance(dj, dict) and str(dj.get("type", "")).lower() == "baseline_init":
         return True
-    # Also treat NULL prev_snapshot_id as baseline init
     return change_row.get("prev_snapshot_id") is None
 
 
 def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
-    schema = {
-        "is_relevant": "boolean",
-        "relevance_score": "integer 0-100",
-        "local_risk_score": "integer 0-100 (impact to fraud signals)",
-        "event_type": "string (policy_change | api_signal_change | security_update | enforcement_change | baseline_init | other)",
-        "title": "string (short)",
-        "summary": "string (1-3 sentences, concrete)",
-        "tags": ["string (short tags)"],
-        "what_changed_hint": "string (short hint)",
-    }
 
-    header = "BASELINE INITIAL INGESTION (no previous snapshot)" if baseline else "DIFF UPDATE (previous vs new)"
+    header = "BASELINE INITIAL INGESTION" if baseline else "DIFF UPDATE"
 
-    return (
-        f"{header}\n"
-        f"SOURCE: {url}\n\n"
-        f"OLD (trimmed):\n{(old_text or '')[:4500]}\n\n"
-        f"NEW (trimmed):\n{(new_text or '')[:4500]}\n\n"
-        "Return JSON only.\n"
-        f"Schema:\n{schema}"
-    )
+    return f"""
+{header}
+SOURCE: {url}
+
+OLD TEXT:
+{(old_text or '')[:4500]}
+
+NEW TEXT:
+{(new_text or '')[:4500]}
+
+Return JSON:
+{{
+"is_relevant": boolean,
+"relevance_score": integer 0-100,
+"local_risk_score": integer 0-100,
+"event_type": string,
+"title": string,
+"summary": string (fraud-impact oriented),
+"tags": list
+}}
+"""
 
 
 def main() -> int:
-    agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
-    threshold = int(os.getenv("RELEVANCE_THRESHOLD", "70"))
-    model = os.getenv("MODEL_TRIAGE", "llama-3.1-8b-instant")
 
-    client = get_llm_client()
+    agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
+
+    # 🔥 Lowered threshold
+    threshold = int(os.getenv("RELEVANCE_THRESHOLD", "60"))
+
+    model = os.getenv("MODEL_TRIAGE", "meta/llama3-8b-instruct")
+
+    client = NimClient()
+
     run_id = create_agent_run(
         run_name="sentinel-triage",
         trigger="workflow_dispatch",
-        llm_backend=os.getenv("LLM_BASE_URL", "default"),
+        llm_backend="nvidia-nim",
     )
 
     stats = {"triaged": 0, "ignored": 0, "events_created": 0, "errors": 0}
 
     try:
-        changes = get_pending_changes_for_triage(limit=25)
+        changes = get_pending_changes_for_triage(limit=40)
+
         if not changes:
             finish_agent_run(run_id, status="success", stats={**stats, "note": "no pending changes"})
             return 0
 
         for ch in changes:
+
             change_id = int(ch["id"])
             source_id = int(ch["source_id"])
-            old_id = ch.get("prev_snapshot_id")  # may be None
+            old_id = ch.get("prev_snapshot_id")
             new_id = ch.get("new_snapshot_id")
 
             baseline = _is_baseline_init(ch)
@@ -113,83 +129,53 @@ def main() -> int:
             url = get_source_url(source_id) or f"source_id={source_id}"
 
             try:
-                prompt = build_prompt(old_text, new_text, url, baseline=baseline)
-                out = chat_json(
-                    client=client,
+                prompt = build_prompt(old_text, new_text, url, baseline)
+
+                out = client.chat_json(
                     model=model,
                     system=SYSTEM_TRIAGE,
                     user=prompt,
                     temperature=0.0,
-                    max_tokens=320,
+                    max_tokens=420,
                 )
 
                 is_rel = bool(out.get("is_relevant", False))
-                rel_score = _as_int(out.get("relevance_score", 0), 0)
-                local_risk = _as_int(out.get("local_risk_score", 0), 0)
+                rel_score = _as_int(out.get("relevance_score"), 0)
+                local_risk = _as_int(out.get("local_risk_score"), 0)
                 tags = _as_tags(out.get("tags", []))
-                event_type = str(out.get("event_type", "baseline_init" if baseline else "other"))[:40]
-                title = str(out.get("title", "Baseline captured" if baseline else "Update detected")).strip()[:120]
-                summary = str(out.get("summary", "")).strip()[:900] or str(out.get("what_changed_hint", "")).strip()[:260]
-
-                # For baseline init, be demo-friendly
-                if baseline and rel_score == 0:
-                    rel_score = 75
-                if baseline and local_risk == 0:
-                    local_risk = 55
-                if baseline and event_type == "other":
-                    event_type = "baseline_init"
 
                 if (not is_rel) or (rel_score < threshold):
                     update_change_triage_fields(
-                        change_id=change_id,
-                        status="ignored",
-                        relevance_score=rel_score,
-                        local_risk_score=local_risk,
-                        tags=tags,
-                    )
-                    audit_log(
-                        run_id=run_id,
-                        agent_name=agent_name,
-                        action="triage_ignored",
-                        ref_type="change",
-                        ref_id=change_id,
-                        detail={"relevance_score": rel_score, "local_risk_score": local_risk, "tags": tags, "baseline": baseline},
+                        change_id,
+                        "ignored",
+                        rel_score,
+                        local_risk,
+                        tags,
                     )
                     stats["ignored"] += 1
                     continue
 
                 update_change_triage_fields(
-                    change_id=change_id,
-                    status="triaged",
-                    relevance_score=rel_score,
-                    local_risk_score=local_risk,
-                    tags=tags,
+                    change_id,
+                    "triaged",
+                    rel_score,
+                    local_risk,
+                    tags,
                 )
 
-                event_payload: Dict[str, Any] = {
+                insert_agent_event({
                     "source_id": source_id,
                     "snapshot_id": int(new_id),
                     "change_id": change_id,
                     "agent_name": agent_name,
-                    "event_type": event_type,
-                    "title": title,
-                    "summary": summary,
+                    "event_type": out.get("event_type"),
+                    "title": out.get("title"),
+                    "summary": out.get("summary"),
                     "tags": tags,
                     "relevance_score": rel_score,
                     "local_risk_score": local_risk,
                     "status": "new",
-                }
-
-                event_id = insert_agent_event(event_payload)
-
-                audit_log(
-                    run_id=run_id,
-                    agent_name=agent_name,
-                    action="triage_event_created",
-                    ref_type="agent_event",
-                    ref_id=int(event_id or 0),
-                    detail={"change_id": change_id, "baseline": baseline},
-                )
+                })
 
                 stats["triaged"] += 1
                 stats["events_created"] += 1
@@ -202,14 +188,14 @@ def main() -> int:
                     action="triage_error",
                     ref_type="change",
                     ref_id=change_id,
-                    detail={"error": str(e)[:500]},
+                    detail={"error": str(e)[:400]},
                 )
 
-        finish_agent_run(run_id, status="success", stats=stats)
+        finish_agent_run(run_id, "success", stats)
         return 0
 
     except Exception as e:
-        finish_agent_run(run_id, status="failed", stats={**stats, "fatal": str(e)[:500]})
+        finish_agent_run(run_id, "failed", {"fatal": str(e)})
         raise
 
 
