@@ -15,11 +15,15 @@ from .nim_client import NimClient
 
 
 SYSTEM_TRIAGE = (
-    "You are a Sentinel triage AI agent for a digital fraud risk team. "
-    "Given OLD vs NEW platform text, decide if this update is relevant to digital fraud risk monitoring. "
-    "Focus on platform capability changes, identity or device signals, policy enforcement, telemetry, SDK changes, and attacker opportunities. "
-    "Be strict. Prefer false negatives if uncertain. "
-    "Return ONLY valid JSON, no markdown."
+    "You are a Sentinel triage agent for a digital fraud and risk intelligence system. "
+    "Given OLD vs NEW platform text, decide if this update matters for risk monitoring and risk model effectiveness. "
+    "Focus on platform capability changes, identity or device signals, policy enforcement, telemetry, SDK changes, "
+    "account integrity changes, verification flows, anti abuse signals, and attacker opportunities. "
+    "Be strict for DIFF updates. Prefer false negatives if uncertain. "
+    "For baseline_init, do NOT say 'no changes detected'. Instead summarize what signals, enforcement points, or policies exist "
+    "and what should be monitored going forward. "
+    "Return ONLY valid JSON, no markdown. "
+    "Summary MUST be 6 to 10 bullets, each bullet begins with '-' and is concrete."
 )
 
 
@@ -30,7 +34,7 @@ def _as_int(x: Any, default: int = 0) -> int:
         return default
 
 
-def _as_tags(x: Any, max_items: int = 8) -> List[str]:
+def _as_tags(x: Any, max_items: int = 10) -> List[str]:
     if not isinstance(x, list):
         return []
     out: List[str] = []
@@ -55,12 +59,12 @@ def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
     schema = {
         "is_relevant": "boolean",
         "relevance_score": "integer 0-100",
-        "local_risk_score": "integer 0-100 (impact to fraud signals)",
-        "event_type": "string (policy_change | api_signal_change | security_update | enforcement_change | baseline_init | other)",
-        "title": "string (short)",
-        "summary": "string (1-3 sentences, concrete)",
+        "local_risk_score": "integer 0-100 (impact to risk signals and monitoring coverage)",
+        "event_type": "string (policy_change | api_signal_change | security_update | enforcement_change | telemetry_change | baseline_init | other)",
+        "title": "string (short but specific)",
+        "summary": "string (6-10 bullets, each starts with '-')",
         "tags": ["string (short tags)"],
-        "what_changed_hint": "string (short hint)",
+        "what_changed_hint": "string (1-2 sentences, short hint)",
     }
 
     header = "BASELINE INITIAL INGESTION (no previous snapshot)" if baseline else "DIFF UPDATE (previous vs new)"
@@ -68,20 +72,24 @@ def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
     return (
         f"{header}\n"
         f"SOURCE: {url}\n\n"
+        "Task:\n"
+        "- If DIFF UPDATE: identify what changed and why it matters for risk monitoring.\n"
+        "- If BASELINE: extract what the platform provides (signals, enforcement, policy rules, integrity features) and what to monitor.\n\n"
         f"OLD (trimmed):\n{(old_text or '')[:4500]}\n\n"
         f"NEW (trimmed):\n{(new_text or '')[:4500]}\n\n"
         "Return JSON only.\n"
+        "Do not add extra keys. Do not wrap in markdown.\n"
         f"Schema:\n{schema}"
     )
 
 
 def main() -> int:
     agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
-    threshold = int(os.getenv("RELEVANCE_THRESHOLD", "70"))
+    threshold = int(os.getenv("RELEVANCE_THRESHOLD", "60"))
     model = os.getenv("MODEL_TRIAGE", "meta/llama3-8b-instruct")
 
-    # Baseline behavior toggle for testing
-    # If "true": always create triage events for baseline-init changes.
+    # Testing mode: you truncate tables every run, so baseline is always first-run.
+    # Keep this true so at least one triaged event exists per run.
     baseline_force = os.getenv("BASELINE_FORCE_TRIAGE", "true").strip().lower() in ("1", "true", "yes")
 
     debug = os.getenv("DEBUG_LLM", "").strip() in ("1", "true", "TRUE", "yes", "YES")
@@ -123,7 +131,7 @@ def main() -> int:
                     system=SYSTEM_TRIAGE,
                     user=prompt,
                     temperature=0.0,
-                    max_tokens=320,
+                    max_tokens=520,  # increased for longer bullet summaries
                     request_id=f"change={change_id}",
                 )
 
@@ -132,12 +140,14 @@ def main() -> int:
                 local_risk = _as_int(out.get("local_risk_score", 0), 0)
                 tags = _as_tags(out.get("tags", []))
                 event_type = str(out.get("event_type", "baseline_init" if baseline else "other"))[:40]
-                title = str(out.get("title", "Baseline captured" if baseline else "Update detected")).strip()[:120]
-                summary = str(out.get("summary", "")).strip()[:900] or str(out.get("what_changed_hint", "")).strip()[:260]
+                title = str(out.get("title", "Baseline captured" if baseline else "Update detected")).strip()[:160]
+                summary = (
+                    str(out.get("summary", "")).strip()[:1800]
+                    or str(out.get("what_changed_hint", "")).strip()[:400]
+                )
 
-                # ---- KEY FIX FOR YOUR TESTING MODE ----
-                # If baseline-init and you're truncating tables each run,
-                # force at least one triaged event so coordinator always writes outputs.
+                # Baseline testing mode: guarantee at least one triaged event so coordinator writes outputs.
+                # We still keep the model-generated title and summary, but force relevance and scores.
                 if baseline and baseline_force:
                     is_rel = True
                     if rel_score == 0:
@@ -147,7 +157,7 @@ def main() -> int:
                     if event_type == "other":
                         event_type = "baseline_init"
                     if not summary:
-                        summary = "Baseline captured for monitoring."
+                        summary = "- Baseline captured for ongoing monitoring."
 
                 if debug:
                     print(
@@ -155,6 +165,7 @@ def main() -> int:
                         f"is_relevant_raw={out.get('is_relevant', None)} relevance_score_raw={out.get('relevance_score', None)} "
                         f"parsed_is_rel={is_rel} parsed_rel_score={rel_score} threshold={threshold}"
                     )
+                    print(f"[TRIAGE] out_head change_id={change_id}: {str(out)[:1200]}")
 
                 # Decision gate
                 if (not is_rel) or (rel_score < threshold):
