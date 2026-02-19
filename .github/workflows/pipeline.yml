@@ -21,6 +21,7 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Cache HuggingFace models (speeds up embedding load)
       - name: Cache HF models
         uses: actions/cache@v4
         with:
@@ -33,7 +34,11 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Seed sources
+      # -----------------------------
+      # Data Layer
+      # -----------------------------
+
+      - name: Seed sources (idempotent)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -47,7 +52,7 @@ jobs:
           USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
         run: python -m src.discover_bulletins
 
-      - name: Scrape sources
+      - name: Scrape sources (snapshots + baseline embeddings)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -56,7 +61,7 @@ jobs:
           EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
         run: python -m src.scrape_sources
 
-      - name: Detect changes
+      - name: Detect changes (delta embeddings + baseline-init)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -65,12 +70,16 @@ jobs:
           BASELINE_MAX_SOURCES: "10"
         run: python -m src.detect_changes
 
+      # -----------------------------
+      # Agent Layer
+      # -----------------------------
+
       - name: Sentinel triage agent
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
           MODEL_TRIAGE: "meta/llama3-8b-instruct"
 
@@ -78,12 +87,12 @@ jobs:
           RELEVANCE_THRESHOLD: "60"
         run: python -m src.agent_sentinel_triage
 
-      - name: Coordinator agent
+      - name: Coordinator agent (RAG + recommendations)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
           MODEL_ANALYZE: "meta/llama3-8b-instruct"
 
