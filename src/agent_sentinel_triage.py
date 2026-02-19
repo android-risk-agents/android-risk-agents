@@ -122,8 +122,8 @@ def main() -> int:
                     max_tokens=320,
                 )
 
-                is_rel = bool(out.get("is_relevant", False))
-                rel_score = _as_int(out.get("relevance_score", 0), 0)
+                is_rel = bool(out.get("is_relevant", out.get("relevant", False)))
+                rel_score = _as_int(out.get("relevance_score", out.get("relevance", out.get("score", 0))), 0)
                 local_risk = _as_int(out.get("local_risk_score", 0), 0)
                 tags = _as_tags(out.get("tags", []))
                 event_type = str(out.get("event_type", "baseline_init" if baseline else "other"))[:40]
@@ -132,7 +132,7 @@ def main() -> int:
 
                 # Baseline demo-friendly behavior preserved
                 if baseline and rel_score == 0:
-                    rel_score = 75
+                    rel_score = 60
                 if baseline and local_risk == 0:
                     local_risk = 55
                 if baseline and event_type == "other":
