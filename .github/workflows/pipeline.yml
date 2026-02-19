@@ -21,7 +21,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Cache HuggingFace models (speeds up embedding load)
       - name: Cache HF models
         uses: actions/cache@v4
         with:
@@ -82,9 +81,11 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
-          # agent controls only (LLM URL/model hardcoded in code)
           AGENT_NAME: "sentinel-triage"
           RELEVANCE_THRESHOLD: "60"
+
+          # DEBUG: print NIM raw output + parsed keys into Actions logs
+          DEBUG_LLM: "1"
         run: python -m src.agent_sentinel_triage
 
       - name: Coordinator agent (RAG + recommendations)
@@ -93,8 +94,10 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
-          # agent controls only (LLM URL/model hardcoded in code)
           AGENT_NAME: "coordinator"
           RAG_TOP_K: "6"
           MAX_RECOMMENDATIONS: "8"
+
+          # Optional: keep on for now so we can debug coordinator too
+          DEBUG_LLM: "1"
         run: python -m src.agent_coordinator

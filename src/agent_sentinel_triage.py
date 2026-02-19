@@ -78,9 +78,9 @@ def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
 def main() -> int:
     agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
     threshold = int(os.getenv("RELEVANCE_THRESHOLD", "70"))
-
-    # Keep old behavior: env override allowed, but default is now NIM-friendly
     model = os.getenv("MODEL_TRIAGE", "meta/llama3-8b-instruct")
+
+    debug = os.getenv("DEBUG_LLM", "").strip() in ("1", "true", "TRUE", "yes", "YES")
 
     client = NimClient()
 
@@ -120,17 +120,26 @@ def main() -> int:
                     user=prompt,
                     temperature=0.0,
                     max_tokens=320,
+                    request_id=f"change={change_id}",
                 )
 
-                is_rel = bool(out.get("is_relevant", out.get("relevant", False)))
-                rel_score = _as_int(out.get("relevance_score", out.get("relevance", out.get("score", 0))), 0)
+                is_rel = bool(out.get("is_relevant", False))
+                rel_score = _as_int(out.get("relevance_score", 0), 0)
                 local_risk = _as_int(out.get("local_risk_score", 0), 0)
                 tags = _as_tags(out.get("tags", []))
                 event_type = str(out.get("event_type", "baseline_init" if baseline else "other"))[:40]
                 title = str(out.get("title", "Baseline captured" if baseline else "Update detected")).strip()[:120]
                 summary = str(out.get("summary", "")).strip()[:900] or str(out.get("what_changed_hint", "")).strip()[:260]
 
-                # Baseline demo-friendly behavior preserved
+                if debug:
+                    print(
+                        f"[TRIAGE] change_id={change_id} baseline={baseline} "
+                        f"is_relevant_raw={out.get('is_relevant', None)} relevance_score_raw={out.get('relevance_score', None)} "
+                        f"parsed_is_rel={is_rel} parsed_rel_score={rel_score} threshold={threshold}"
+                    )
+                    print(f"[TRIAGE] out_head change_id={change_id}: {str(out)[:1200]}")
+
+                # For baseline init, be demo-friendly
                 if baseline and rel_score == 0:
                     rel_score = 60
                 if baseline and local_risk == 0:

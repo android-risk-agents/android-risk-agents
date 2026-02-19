@@ -12,8 +12,11 @@ import requests
 
 class NimClient:
     """
-    Minimal NIM client that returns JSON dicts.
-    Hardcoded endpoint by default, only secret needed is NVIDIA_API_KEY.
+    NIM OpenAI-compatible chat/completions client with hardened JSON extraction
+    + GitHub Actions-visible debug logging.
+
+    Only secret required: NVIDIA_API_KEY
+    Endpoint + model are hardcoded in code (as discussed).
     """
 
     def __init__(self):
@@ -21,12 +24,13 @@ class NimClient:
         if not self.api_key:
             raise RuntimeError("Missing NVIDIA_API_KEY")
 
-        # Hardcode NIM chat endpoint here (as discussed)
+        # Hardcoded NIM endpoint
         self.chat_url = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-        # Optional tuning knobs (can stay as defaults)
         self.timeout_s = int(os.getenv("NIM_TIMEOUT_S", "90"))
         self.retries = int(os.getenv("NIM_RETRIES", "3"))
+
+        self.debug = os.getenv("DEBUG_LLM", "").strip() in ("1", "true", "TRUE", "yes", "YES")
 
     def chat_json(
         self,
@@ -35,7 +39,9 @@ class NimClient:
         user: str,
         temperature: float = 0.0,
         max_tokens: int = 400,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+
         payload = {
             "model": model,
             "messages": [
@@ -62,20 +68,42 @@ class NimClient:
                     timeout=self.timeout_s,
                 )
 
+                if self.debug:
+                    rid = f" rid={request_id}" if request_id else ""
+                    print(f"[NIM] status={resp.status_code} attempt={attempt}{rid}")
+
                 if resp.status_code != 200:
-                    raise RuntimeError(f"NIM error {resp.status_code}: {resp.text[:1200]}")
+                    txt = resp.text or ""
+                    if self.debug:
+                        print(f"[NIM] error_body_head: {txt[:1200]}")
+                    raise RuntimeError(f"NIM error {resp.status_code}: {txt[:1200]}")
 
                 data = resp.json()
                 content = (
                     data.get("choices", [{}])[0]
                     .get("message", {})
                     .get("content", "")
-                )
+                ) or ""
 
-                return self._extract_json_only(content)
+                if self.debug:
+                    rid = f" rid={request_id}" if request_id else ""
+                    print(f"[NIM] content_head{rid}: {content[:1200]}")
+
+                parsed = self._extract_json_only(content)
+
+                if self.debug:
+                    rid = f" rid={request_id}" if request_id else ""
+                    keys = list(parsed.keys()) if isinstance(parsed, dict) else []
+                    print(f"[NIM] parsed_keys{rid}: {keys}")
+
+                return parsed
 
             except Exception as e:
                 last_err = e
+                if self.debug:
+                    rid = f" rid={request_id}" if request_id else ""
+                    print(f"[NIM] exception{rid}: {type(e).__name__}: {str(e)[:300]}")
+
                 if attempt >= self.retries:
                     break
 
@@ -104,7 +132,8 @@ class NimClient:
     @classmethod
     def _extract_json_only(cls, text: str) -> Dict[str, Any]:
         """
-        Parses the FIRST JSON object found (avoids JSONDecodeError: Extra data).
+        Robustly parse the FIRST JSON object from the model output.
+        Avoids 'Extra data' by using JSONDecoder.raw_decode.
         """
         t = cls._strip_fences(text)
 
