@@ -80,6 +80,10 @@ def main() -> int:
     threshold = int(os.getenv("RELEVANCE_THRESHOLD", "70"))
     model = os.getenv("MODEL_TRIAGE", "meta/llama3-8b-instruct")
 
+    # Baseline behavior toggle for testing
+    # If "true": always create triage events for baseline-init changes.
+    baseline_force = os.getenv("BASELINE_FORCE_TRIAGE", "true").strip().lower() in ("1", "true", "yes")
+
     debug = os.getenv("DEBUG_LLM", "").strip() in ("1", "true", "TRUE", "yes", "YES")
 
     client = NimClient()
@@ -131,22 +135,28 @@ def main() -> int:
                 title = str(out.get("title", "Baseline captured" if baseline else "Update detected")).strip()[:120]
                 summary = str(out.get("summary", "")).strip()[:900] or str(out.get("what_changed_hint", "")).strip()[:260]
 
+                # ---- KEY FIX FOR YOUR TESTING MODE ----
+                # If baseline-init and you're truncating tables each run,
+                # force at least one triaged event so coordinator always writes outputs.
+                if baseline and baseline_force:
+                    is_rel = True
+                    if rel_score == 0:
+                        rel_score = 75
+                    if local_risk == 0:
+                        local_risk = 55
+                    if event_type == "other":
+                        event_type = "baseline_init"
+                    if not summary:
+                        summary = "Baseline captured for monitoring."
+
                 if debug:
                     print(
-                        f"[TRIAGE] change_id={change_id} baseline={baseline} "
+                        f"[TRIAGE] change_id={change_id} baseline={baseline} baseline_force={baseline_force} "
                         f"is_relevant_raw={out.get('is_relevant', None)} relevance_score_raw={out.get('relevance_score', None)} "
                         f"parsed_is_rel={is_rel} parsed_rel_score={rel_score} threshold={threshold}"
                     )
-                    print(f"[TRIAGE] out_head change_id={change_id}: {str(out)[:1200]}")
 
-                # For baseline init, be demo-friendly
-                if baseline and rel_score == 0:
-                    rel_score = 60
-                if baseline and local_risk == 0:
-                    local_risk = 55
-                if baseline and event_type == "other":
-                    event_type = "baseline_init"
-
+                # Decision gate
                 if (not is_rel) or (rel_score < threshold):
                     update_change_triage_fields(
                         change_id=change_id,
