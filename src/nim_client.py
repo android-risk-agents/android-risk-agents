@@ -28,6 +28,10 @@ _RE_ILLEGAL_CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
 _RE_MISSING_COMMA_BEFORE_KEY = re.compile(r'(["}\]])\s*(")')
 
+# New: safe fixes for common LLM JSON glitches
+_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")   # ,: "key"
+_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")  # ,: } or ,: ]
+
 
 def _strip_code_fences(s: str) -> str:
     s = (s or "").strip()
@@ -101,7 +105,6 @@ def _unwrap_singleton_list(obj: Any) -> Any:
 def _extract_json_block(s: str) -> str:
     """
     Extract a likely JSON block by trimming leading chatter and trailing chatter.
-    This is not perfect, but it handles common cases where the model adds extra text.
 
     Strategy:
     - find first '{' or '['
@@ -134,14 +137,28 @@ def _extract_json_block(s: str) -> str:
 
 def _repair_common_json_syntax(s: str) -> str:
     """
-    Repair only very common, low-risk issues:
+    Repair only very common, low-risk issues that LLMs frequently emit.
+
+    Safe repairs included:
     - trailing commas before } or ]
+    - stray ',:' token before next key or before closing brace/bracket
     - missing comma between a value-ending token and the next key quote
     """
     if not s:
         return s
+
+    # 1) Remove trailing commas: ", }" or ", ]"
     s = _RE_TRAILING_COMMA.sub(r"\1", s)
+
+    # 2) Fix stray comma-colon glitch: ,: "key"
+    s = _RE_COMMA_COLON_BEFORE_QUOTE.sub(r', \1', s)
+
+    # 3) Fix stray comma-colon before closing: ,: } or ,: ]
+    s = _RE_COMMA_COLON_BEFORE_CLOSE.sub(r"\1", s)
+
+    # 4) Insert missing comma before a new key quote after a value-ending token
     s = _RE_MISSING_COMMA_BEFORE_KEY.sub(r"\1, \2", s)
+
     return s
 
 
@@ -201,6 +218,7 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
     """
     obj, err = _safe_json_loads(text)
     if err is not None:
+        # Keep previous behavior: raise JSONDecodeError for callers to retry
         raise json.JSONDecodeError(err, doc=text or "", pos=0)  # pos not reliable here
 
     obj = _unwrap_singleton_list(obj)
@@ -216,6 +234,9 @@ def _extract_content_from_nim_envelope(raw_text: str) -> str:
     """
     NIM returns an OpenAI-compatible envelope JSON. This function parses it
     robustly and extracts choices[0].message.content.
+
+    Note: we run the same safe parsing pipeline here because NIM responses can
+    include control characters or minor formatting anomalies.
     """
     obj, err = _safe_json_loads(raw_text)
     if err is not None:
@@ -267,14 +288,14 @@ class NimClient:
         """
         Calls NIM chat/completions and returns parsed JSON from assistant content.
 
-        Improvements included:
-        - Robust envelope parsing (no direct resp.json reliance)
-        - Stronger JSON extraction, newline escaping inside quoted strings
-        - Low-risk JSON repairs for near-JSON outputs
-        - Debug logging includes targeted context on JSON decode failures
-        - Efficient normalization with precompiled regex
-        - Retry strategy keeps max_retries functionality but reduces wasted retries:
-          local parse repair first, then optional model retry with temperature=0
+        Includes safe, deterministic JSON stabilization:
+        - Strip code fences
+        - Remove illegal control characters
+        - Extract likely JSON block (ignore extra chatter)
+        - Escape raw newlines ONLY inside strings
+        - Fix common LLM punctuation glitches (trailing commas, stray ',:', missing commas)
+        - Debug logs include context if parsing fails
+        - Retry with temperature=0 after first parse failure (keeps original retry behavior)
         """
         rid = request_id or "req"
         url = f"{self.base_url}/chat/completions"
@@ -284,7 +305,7 @@ class NimClient:
             "Accept": "application/json",
         }
 
-        base_payload = {
+        payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
@@ -295,11 +316,6 @@ class NimClient:
         }
 
         last_err: Optional[str] = None
-
-        # We keep the original max_retries behavior, but:
-        # - For each HTTP success response, we attempt local parse fixes before deciding to retry the network call.
-        # - On the first parse failure, we flip temperature to 0.0 for subsequent attempts (if not already).
-        payload = dict(base_payload)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -336,12 +352,9 @@ class NimClient:
                 try:
                     parsed = _extract_first_json_obj(content)
                 except json.JSONDecodeError as e:
-                    # Log context from our normalized candidate, not just raw content head
                     if self.debug:
                         candidate = _prepare_candidate_json(content)
                         print(f"[NIM] json_error rid={rid}: {str(e)[:400]}")
-                        # Provide a readable slice for debugging. If error string already contains context,
-                        # this is still useful and deterministic.
                         print(f"[NIM] json_candidate_head rid={rid}: {candidate[:900]}")
                     last_err = str(e)
 
