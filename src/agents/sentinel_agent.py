@@ -140,8 +140,8 @@ def main():
             rel_score_int = int(rel_score * 100)
             risk_score_int = int(risk_score * 100)
 
-            # Ignore path
-            if decision == "ignore" or rel_score < threshold:
+            # Ignore path (never ignore baseline/fresh runs)
+            if not baseline and (decision == "ignore" or rel_score < threshold):
                 update_change_triage_fields(
                     change_id=change_id,
                     status="ignored",

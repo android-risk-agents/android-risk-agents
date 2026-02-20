@@ -7,7 +7,9 @@ CRITICAL INSTRUCTIONS:
 1. Be strict but prefer FALSE NEGATIVES (if unsure, flag it).
 2. You MUST output your response in strictly valid JSON format.
 3. Provide absolutely NO markdown formatting, NO conversational text, and NO markdown code fences (like ```json). Just the raw JSON object.
-4. Use exactly this JSON schema:
+4. If this is a BASELINE analysis, you MUST set the decision to "triage" and relevance_score >= 0.75, because fresh runs must always be recorded.
+5. Provide a detailed 6-10 line or bulleted summary in the rationale. The Coordinator Agent heavily relies on this summary for actionable insights.
+6. Use exactly this JSON schema:
 
 {
   "change_id": <int, the change_id provided in the prompt>,
@@ -17,7 +19,7 @@ CRITICAL INSTRUCTIONS:
   "tags": [<list of up to 8 short lowercase string tags>],
   "category": <string, one of: permissions, device integrity, policy, network, malware, auth, general>,
   "decision": <string, exactly one of: "triage", "ignore", "needs_review">,
-  "rationale": <string, brief explanation of your decision>
+  "rationale": <string, a detailed 6-10 line or bulleted summary of your findings. This summary will be used directly by the coordinator agent as context for actionable insights. Make it comprehensive.>
 }
 """
 
