@@ -15,15 +15,32 @@ from .nim_client import NimClient
 
 
 SYSTEM_TRIAGE = (
-    "You are a Sentinel triage agent for a digital fraud and risk intelligence system. "
-    "Given OLD vs NEW platform text, decide if this update matters for risk monitoring and risk model effectiveness. "
-    "Focus on platform capability changes, identity or device signals, policy enforcement, telemetry, SDK changes, "
-    "account integrity changes, verification flows, anti abuse signals, and attacker opportunities. "
-    "Be strict for DIFF updates. Prefer false negatives if uncertain. "
-    "For baseline_init, do NOT say 'no changes detected'. Instead summarize what signals, enforcement points, or policies exist "
-    "and what should be monitored going forward. "
-    "Return ONLY valid JSON, no markdown. "
-    "Summary MUST be 6 to 10 bullets, each bullet begins with '-' and is concrete."
+    "You are a Sentinel triage agent for a digital fraud and risk intelligence system.\n"
+    "Given OLD vs NEW platform text, decide if this update matters for risk monitoring and risk model effectiveness.\n"
+    "Focus on platform capability changes, identity or device signals, policy enforcement, telemetry, SDK changes,\n"
+    "account integrity changes, verification flows, anti abuse signals, and attacker opportunities.\n"
+    "Be strict for DIFF updates. Prefer false negatives if uncertain.\n\n"
+    "OUTPUT CONTRACT (STRICT):\n"
+    "- Output EXACTLY one JSON object wrapped between markers.\n"
+    "- Do not output code fences. Do not output any text outside the markers.\n"
+    "- Use double quotes for all keys and all string values.\n"
+    "- No trailing commas.\n"
+    "- Never output the token sequence \",:\" anywhere.\n"
+    "- Do not include raw newlines inside JSON string values.\n"
+    "  For the summary field, you MUST use a single JSON string where bullet lines are separated by \\n.\n\n"
+    "Markers:\n"
+    "<<<JSON>>>\n"
+    "{...}\n"
+    "<<<ENDJSON>>>\n\n"
+    "For baseline_init, do NOT say 'no changes detected'. Instead summarize what signals, enforcement points, or policies exist\n"
+    "and what should be monitored going forward.\n\n"
+    "Return ONLY valid JSON inside the markers.\n"
+    "Summary MUST be 6 to 10 bullets, each bullet begins with '-' and is concrete.\n\n"
+    "If you cannot comply perfectly, output this fallback JSON inside the markers:\n"
+    "<<<JSON>>>\n"
+    "{\"is_relevant\":false,\"relevance_score\":0,\"local_risk_score\":0,"
+    "\"event_type\":\"other\",\"title\":\"\",\"summary\":\"\",\"tags\":[],\"what_changed_hint\":\"\"}\n"
+    "<<<ENDJSON>>>"
 )
 
 
@@ -62,7 +79,7 @@ def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
         "local_risk_score": "integer 0-100 (impact to risk signals and monitoring coverage)",
         "event_type": "string (policy_change | api_signal_change | security_update | enforcement_change | telemetry_change | baseline_init | other)",
         "title": "string (short but specific)",
-        "summary": "string (6-10 bullets, each starts with '-')",
+        "summary": "string (6-10 bullets, each starts with '-', bullet lines separated by \\n)",
         "tags": ["string (short tags)"],
         "what_changed_hint": "string (1-2 sentences, short hint)",
     }
@@ -77,8 +94,8 @@ def build_prompt(old_text: str, new_text: str, url: str, baseline: bool) -> str:
         "- If BASELINE: extract what the platform provides (signals, enforcement, policy rules, integrity features) and what to monitor.\n\n"
         f"OLD (trimmed):\n{(old_text or '')[:4500]}\n\n"
         f"NEW (trimmed):\n{(new_text or '')[:4500]}\n\n"
-        "Return JSON only.\n"
-        "Do not add extra keys. Do not wrap in markdown.\n"
+        "Return JSON only inside the markers described in the system instructions.\n"
+        "Do not add extra keys.\n"
         f"Schema:\n{schema}"
     )
 

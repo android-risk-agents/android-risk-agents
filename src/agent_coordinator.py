@@ -19,17 +19,35 @@ from .nim_client import NimClient
 
 
 SYSTEM_ANALYZE = (
-    "You are the Coordinator agent for a digital fraud and risk intelligence system. "
-    "Your job is to translate platform ecosystem updates into detailed, implementable actions for risk monitoring and risk models. "
-    "Do not invent facts. If something is unknown, say unknown. "
-    "Ground your answer in the provided CONTEXT snippets. "
-    "Avoid generic advice. Each recommendation must reference a specific signal, policy section, enforcement mechanism, API, telemetry event, "
-    "or vulnerability theme mentioned in the context. "
-    "Return ONLY valid JSON, no markdown.\n\n"
+    "You are the Coordinator agent for a digital fraud and risk intelligence system.\n"
+    "Your job is to translate platform ecosystem updates into detailed, implementable actions for risk monitoring and risk models.\n"
+    "Do not invent facts. If something is unknown, say unknown.\n"
+    "Ground your answer in the provided CONTEXT snippets.\n"
+    "Avoid generic advice. Each recommendation must reference a specific signal, policy section, enforcement mechanism, API, telemetry event,\n"
+    "or vulnerability theme mentioned in the context.\n\n"
+    "OUTPUT CONTRACT (STRICT):\n"
+    "- Output EXACTLY one JSON object wrapped between markers.\n"
+    "- Do not output code fences. Do not output any text outside the markers.\n"
+    "- Use double quotes for all keys and all string values.\n"
+    "- No trailing commas.\n"
+    "- Never output the token sequence \",:\" anywhere.\n"
+    "- Do not include raw newlines inside JSON string values.\n"
+    "  For summary fields that require bullets, use a single JSON string with bullet lines separated by \\n.\n\n"
+    "Markers:\n"
+    "<<<JSON>>>\n"
+    "{...}\n"
+    "<<<ENDJSON>>>\n\n"
     "Requirements:\n"
     "- summary MUST be 10 to 14 bullets, each bullet begins with '-'.\n"
     "- recommended_actions MUST be 8 to 12 bullets, each begins with '-' and is implementable.\n"
-    "- Include evidence_snippets: 3 to 6 short quotes from context (<=200 chars each).\n"
+    "- Include evidence_snippets: 3 to 6 short quotes from context (<=200 chars each).\n\n"
+    "Return ONLY valid JSON inside the markers.\n"
+    "Do not add extra keys.\n\n"
+    "If you cannot comply perfectly, output this fallback JSON inside the markers:\n"
+    "<<<JSON>>>\n"
+    "{\"title\":\"\",\"summary\":\"\",\"category\":\"other\",\"affected_signals\":[],"
+    "\"recommended_actions\":[],\"risk_score\":2,\"confidence\":0.65,\"evidence_snippets\":[]}\n"
+    "<<<ENDJSON>>>"
 )
 
 
@@ -79,7 +97,7 @@ def _tags(ev: Dict[str, Any], max_items: int = 12) -> List[str]:
 def build_deep_insight_prompt(url: str, title: str, summary: str, context: str, baseline: bool) -> str:
     schema = {
         "title": "string (specific, include feature or policy name when possible)",
-        "summary": "string (10-14 bullets, each starts with '-')",
+        "summary": "string (10-14 bullets, each starts with '-', bullet lines separated by \\n)",
         "category": "string (vulnerability_intel | policy_intel | api_signal_change | enforcement_change | telemetry_change | other)",
         "affected_signals": ["string (up to 8, specific signals or controls)"],
         "recommended_actions": ["string (8-12 bullets, each starts with '-')"],
@@ -102,8 +120,8 @@ def build_deep_insight_prompt(url: str, title: str, summary: str, context: str, 
         "- If MODE is UPDATE_INTELLIGENCE: explain what changed and how it could affect monitoring coverage and risk decisions.\n"
         "- Make recommendations implementable. Prefer concrete checks, alerts, rules, thresholds, and validation steps.\n\n"
         f"CONTEXT (RAG snippets):\n{context[:9000]}\n\n"
-        "Return JSON only.\n"
-        "Do not add extra keys. Do not wrap in markdown.\n"
+        "Return JSON only inside the markers described in the system instructions.\n"
+        "Do not add extra keys.\n"
         f"Schema:\n{schema}"
     )
 

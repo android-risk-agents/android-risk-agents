@@ -28,9 +28,11 @@ _RE_ILLEGAL_CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
 _RE_MISSING_COMMA_BEFORE_KEY = re.compile(r'(["}\]])\s*(")')
 
-# New: safe fixes for common LLM JSON glitches
-_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")   # ,: "key"
-_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")  # ,: } or ,: ]
+# Safe fixes for common LLM JSON glitches:
+_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")         # ,: "key"
+_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")      # ,: } or ,: ]
+_RE_DANGLING_COMMA_COLON_EOF = re.compile(r",\s*:\s*$")            # ,: <EOF>
+_RE_DANGLING_QUOTE_COMMA_COLON_CLOSE = re.compile(r'"\s*,\s*:\s*([}\]])')  # "...",: } or ]
 
 
 def _strip_code_fences(s: str) -> str:
@@ -50,6 +52,20 @@ def _remove_illegal_control_chars(s: str) -> str:
     if not s:
         return s
     return _RE_ILLEGAL_CTRL.sub("", s)
+
+
+def _extract_between_markers(text: str, start: str = "<<<JSON>>>", end: str = "<<<ENDJSON>>>") -> str:
+    """
+    If model wraps JSON in markers, extract only the payload between them.
+    Safe: if markers not present, returns original text.
+    """
+    if not text:
+        return text
+    i = text.find(start)
+    j = text.rfind(end)
+    if i != -1 and j != -1 and j > i:
+        return text[i + len(start) : j].strip()
+    return text
 
 
 def _escape_newlines_inside_strings(s: str) -> str:
@@ -137,26 +153,34 @@ def _extract_json_block(s: str) -> str:
 
 def _repair_common_json_syntax(s: str) -> str:
     """
-    Repair only very common, low-risk issues that LLMs frequently emit.
+    Repair only very common, low-risk issues LLMs emit.
+    These fixes do not invent content, they only remove illegal punctuation patterns.
 
-    Safe repairs included:
+    Repairs:
     - trailing commas before } or ]
-    - stray ',:' token before next key or before closing brace/bracket
+    - stray ',:' before next key or before close or at end
     - missing comma between a value-ending token and the next key quote
+    - special case: '",: }' or '",: ]'
     """
     if not s:
         return s
 
-    # 1) Remove trailing commas: ", }" or ", ]"
+    # Special: "...",: }  -> "..."}
+    s = _RE_DANGLING_QUOTE_COMMA_COLON_CLOSE.sub(r'"\1', s)
+
+    # Remove trailing commas: ", }" or ", ]"
     s = _RE_TRAILING_COMMA.sub(r"\1", s)
 
-    # 2) Fix stray comma-colon glitch: ,: "key"
-    s = _RE_COMMA_COLON_BEFORE_QUOTE.sub(r', \1', s)
+    # Fix stray comma-colon glitch: ,: "key"
+    s = _RE_COMMA_COLON_BEFORE_QUOTE.sub(r", \1", s)
 
-    # 3) Fix stray comma-colon before closing: ,: } or ,: ]
+    # Fix stray comma-colon before closing: ,: } or ,: ]
     s = _RE_COMMA_COLON_BEFORE_CLOSE.sub(r"\1", s)
 
-    # 4) Insert missing comma before a new key quote after a value-ending token
+    # Fix stray comma-colon at end of string: ,: <EOF>
+    s = _RE_DANGLING_COMMA_COLON_EOF.sub("", s)
+
+    # Insert missing comma between a value-ending token and the next key quote
     s = _RE_MISSING_COMMA_BEFORE_KEY.sub(r"\1, \2", s)
 
     return s
@@ -175,19 +199,22 @@ def _json_error_context(s: str, pos: Optional[int], window: int = 250) -> str:
 def _prepare_candidate_json(text: str) -> str:
     """
     Normalize candidate JSON string:
+    - extract between markers
     - strip fences
     - remove illegal control chars
     - extract likely json block
     - escape newlines inside strings
-    - repair common syntax issues
+    - repair common syntax issues (two passes, deterministic)
     """
-    t = _strip_code_fences(text)
+    t = _extract_between_markers(text)
+    t = _strip_code_fences(t)
     t = _remove_illegal_control_chars(t)
-    t = t.strip()
+    t = (t or "").strip()
     t = _extract_json_block(t)
     t = _escape_newlines_inside_strings(t)
     t = _repair_common_json_syntax(t)
-    return t.strip()
+    t = _repair_common_json_syntax(t)  # second deterministic pass
+    return (t or "").strip()
 
 
 def _safe_json_loads(text: str) -> Tuple[Any, Optional[str]]:
@@ -218,7 +245,6 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
     """
     obj, err = _safe_json_loads(text)
     if err is not None:
-        # Keep previous behavior: raise JSONDecodeError for callers to retry
         raise json.JSONDecodeError(err, doc=text or "", pos=0)  # pos not reliable here
 
     obj = _unwrap_singleton_list(obj)
@@ -232,29 +258,16 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
 
 def _extract_content_from_nim_envelope(raw_text: str) -> str:
     """
-    NIM returns an OpenAI-compatible envelope JSON. This function parses it
-    robustly and extracts choices[0].message.content.
-
-    Note: we run the same safe parsing pipeline here because NIM responses can
-    include control characters or minor formatting anomalies.
+    NIM returns an OpenAI-compatible envelope JSON. Parse and extract choices[0].message.content.
+    We apply illegal-control cleanup before json.loads to avoid envelope parse failures.
     """
-    obj, err = _safe_json_loads(raw_text)
-    if err is not None:
-        raise json.JSONDecodeError(err, doc=raw_text or "", pos=0)
+    cleaned = _remove_illegal_control_chars(raw_text or "")
+    data = json.loads(cleaned)
 
-    if not isinstance(obj, dict):
-        return ""
-
-    choices = obj.get("choices") or []
-    if not choices or not isinstance(choices, list):
-        return ""
-
-    first = choices[0] if isinstance(choices[0], dict) else {}
-    msg = first.get("message") or {}
-    if not isinstance(msg, dict):
-        return ""
-
-    content = msg.get("content") or ""
+    content = (
+        (((data.get("choices") or [{}])[0]).get("message") or {}).get("content")
+        or ""
+    )
     return content if isinstance(content, str) else ""
 
 
@@ -288,14 +301,12 @@ class NimClient:
         """
         Calls NIM chat/completions and returns parsed JSON from assistant content.
 
-        Includes safe, deterministic JSON stabilization:
-        - Strip code fences
-        - Remove illegal control characters
-        - Extract likely JSON block (ignore extra chatter)
-        - Escape raw newlines ONLY inside strings
-        - Fix common LLM punctuation glitches (trailing commas, stray ',:', missing commas)
-        - Debug logs include context if parsing fails
-        - Retry with temperature=0 after first parse failure (keeps original retry behavior)
+        Reliability layers:
+        - envelope parse with control-char cleanup
+        - marker extraction (<<<JSON>>> ... <<<ENDJSON>>>)
+        - safe normalization, newline escaping, low-risk punctuation repairs
+        - debug context for failures
+        - retries (forces temperature=0 after first parse failure)
         """
         rid = request_id or "req"
         url = f"{self.base_url}/chat/completions"
@@ -335,30 +346,30 @@ class NimClient:
                 if self.debug:
                     print(f"[NIM] resp_text_head rid={rid}: {_remove_illegal_control_chars(raw_text[:900])}")
 
-                # Parse NIM envelope safely
+                # Envelope parse
                 try:
                     content = _extract_content_from_nim_envelope(raw_text)
-                except json.JSONDecodeError as e:
+                except Exception as e:
                     last_err = str(e)
                     if self.debug:
-                        print(f"[NIM] envelope_json_error rid={rid}: {last_err[:400]}")
+                        print(f"[NIM] envelope_error rid={rid}: {last_err[:400]}")
                     time.sleep(0.8 * attempt)
                     continue
 
                 if self.debug:
                     print(f"[NIM] content_head rid={rid}: {_remove_illegal_control_chars(content)[:900]}")
 
-                # Parse assistant content as JSON safely
+                # Content parse
                 try:
                     parsed = _extract_first_json_obj(content)
                 except json.JSONDecodeError as e:
+                    last_err = str(e)
                     if self.debug:
                         candidate = _prepare_candidate_json(content)
-                        print(f"[NIM] json_error rid={rid}: {str(e)[:400]}")
+                        print(f"[NIM] json_error rid={rid}: {last_err[:400]}")
                         print(f"[NIM] json_candidate_head rid={rid}: {candidate[:900]}")
-                    last_err = str(e)
 
-                    # Reduce odds of repeated malformed JSON by forcing temperature=0 on next attempts
+                    # Force deterministic output on subsequent tries
                     if payload.get("temperature", 0.0) != 0.0:
                         payload["temperature"] = 0.0
 
