@@ -1,3 +1,4 @@
+# src/nim_client.py
 from __future__ import annotations
 
 import json
@@ -29,9 +30,9 @@ _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
 _RE_MISSING_COMMA_BEFORE_KEY = re.compile(r'(["}\]])\s*(")')
 
 # Safe fixes for common LLM JSON glitches:
-_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")         # ,: "key"
-_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")      # ,: } or ,: ]
-_RE_DANGLING_COMMA_COLON_EOF = re.compile(r",\s*:\s*$")            # ,: <EOF>
+_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")  # ,: "key"
+_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")  # ,: } or ,: ]
+_RE_DANGLING_COMMA_COLON_EOF = re.compile(r",\s*:\s*$")  # ,: <EOF>
 _RE_DANGLING_QUOTE_COMMA_COLON_CLOSE = re.compile(r'"\s*,\s*:\s*([}\]])')  # "...",: } or ]
 
 
@@ -54,18 +55,33 @@ def _remove_illegal_control_chars(s: str) -> str:
     return _RE_ILLEGAL_CTRL.sub("", s)
 
 
-def _extract_between_markers(text: str, start: str = "<<<JSON>>>", end: str = "<<<ENDJSON>>>") -> str:
+def _extract_between_markers(
+    text: str, start: str = "<<<JSON>>>", end: str = "<<<ENDJSON>>>"
+) -> str:
     """
-    If model wraps JSON in markers, extract only the payload between them.
-    Safe: if markers not present, returns original text.
+    Extract payload between markers.
+    Tolerant to missing start or end marker, which happens with some NIM generations.
     """
     if not text:
         return text
-    i = text.find(start)
-    j = text.rfind(end)
+
+    t = (text or "").strip()
+    i = t.find(start)
+    j = t.rfind(end)
+
+    # Normal case: both markers exist
     if i != -1 and j != -1 and j > i:
-        return text[i + len(start) : j].strip()
-    return text
+        return t[i + len(start) : j].strip()
+
+    # END exists but START doesn't: strip END and continue
+    if i == -1 and j != -1:
+        return t[:j].strip()
+
+    # START exists but END doesn't: take everything after START
+    if i != -1 and j == -1:
+        return t[i + len(start) :].strip()
+
+    return t
 
 
 def _escape_newlines_inside_strings(s: str) -> str:
@@ -118,34 +134,28 @@ def _unwrap_singleton_list(obj: Any) -> Any:
     return obj
 
 
-def _extract_json_block(s: str) -> str:
+def _extract_json_object_block(s: str) -> str:
     """
-    Extract a likely JSON block by trimming leading chatter and trailing chatter.
-
-    Strategy:
-    - find first '{' or '['
+    Extract a likely JSON OBJECT block (not array):
+    - find first '{'
     - slice from there
-    - find last matching closing '}' or ']' and cut there
+    - find last '}' and cut there
+
+    This avoids accidentally accepting array-only outputs like:
+      ["Overview", "Setup", "API reference", ...]
     """
     if not s:
         return s
     s = s.strip()
 
-    i_obj = s.find("{")
-    i_arr = s.find("[")
-    if i_obj == -1 and i_arr == -1:
-        return s
+    i = s.find("{")
+    if i == -1:
+        return s  # let downstream raise
 
-    start = i_obj if i_arr == -1 else (i_arr if i_obj == -1 else min(i_obj, i_arr))
-    s2 = s[start:]
-
-    if s2.startswith("{"):
-        end = s2.rfind("}")
-    else:
-        end = s2.rfind("]")
-
+    s2 = s[i:]
+    end = s2.rfind("}")
     if end == -1:
-        # Possibly truncated response, return what we have so decoder can report a useful error
+        # Possibly truncated response; return what we have
         return s2
 
     return s2[: end + 1]
@@ -165,7 +175,7 @@ def _repair_common_json_syntax(s: str) -> str:
     if not s:
         return s
 
-    # Special: "...",: }  -> "..."}
+    # Special: "...",: }  -> "..." }
     s = _RE_DANGLING_QUOTE_COMMA_COLON_CLOSE.sub(r'"\1', s)
 
     # Remove trailing commas: ", }" or ", ]"
@@ -196,13 +206,26 @@ def _json_error_context(s: str, pos: Optional[int], window: int = 250) -> str:
     return s[start:end]
 
 
+def _looks_truncated_or_non_object(candidate: str) -> bool:
+    if not candidate:
+        return True
+    c = candidate.strip()
+    if not c.startswith("{"):
+        return True
+    if c.count("{") > c.count("}"):
+        return True
+    if not c.endswith("}"):
+        return True
+    return False
+
+
 def _prepare_candidate_json(text: str) -> str:
     """
     Normalize candidate JSON string:
-    - extract between markers
+    - extract between markers (tolerant)
     - strip fences
     - remove illegal control chars
-    - extract likely json block
+    - extract likely json OBJECT block
     - escape newlines inside strings
     - repair common syntax issues (two passes, deterministic)
     """
@@ -210,7 +233,7 @@ def _prepare_candidate_json(text: str) -> str:
     t = _strip_code_fences(t)
     t = _remove_illegal_control_chars(t)
     t = (t or "").strip()
-    t = _extract_json_block(t)
+    t = _extract_json_object_block(t)
     t = _escape_newlines_inside_strings(t)
     t = _repair_common_json_syntax(t)
     t = _repair_common_json_syntax(t)  # second deterministic pass
@@ -225,6 +248,9 @@ def _safe_json_loads(text: str) -> Tuple[Any, Optional[str]]:
     candidate = _prepare_candidate_json(text)
     if not candidate:
         return {}, None
+
+    if _looks_truncated_or_non_object(candidate):
+        return None, "Truncated or non-object JSON detected"
 
     try:
         return json.loads(candidate), None
@@ -265,8 +291,7 @@ def _extract_content_from_nim_envelope(raw_text: str) -> str:
     data = json.loads(cleaned)
 
     content = (
-        (((data.get("choices") or [{}])[0]).get("message") or {}).get("content")
-        or ""
+        (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
     )
     return content if isinstance(content, str) else ""
 
@@ -303,8 +328,10 @@ class NimClient:
 
         Reliability layers:
         - envelope parse with control-char cleanup
-        - marker extraction (<<<JSON>>> ... <<<ENDJSON>>>)
+        - marker extraction tolerant to missing start/end
+        - object-only extraction (forces '{ ... }')
         - safe normalization, newline escaping, low-risk punctuation repairs
+        - truncation/non-object guard (forces retry)
         - debug context for failures
         - retries (forces temperature=0 after first parse failure)
         """

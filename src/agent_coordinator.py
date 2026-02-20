@@ -32,20 +32,20 @@ SYSTEM_ANALYZE = (
     "- No trailing commas.\n"
     "- Never output the token sequence \",:\" anywhere.\n"
     "- Do not include raw newlines inside JSON string values.\n"
-    "  For summary fields that require bullets, use a single JSON string with bullet lines separated by \\n.\n\n"
+    "  For fields that require bullets, return JSON ARRAYS of strings (not a single string with \\n).\n\n"
     "Markers:\n"
     "<<<JSON>>>\n"
     "{...}\n"
     "<<<ENDJSON>>>\n\n"
     "Requirements:\n"
-    "- summary MUST be 10 to 14 bullets, each bullet begins with '-'.\n"
-    "- recommended_actions MUST be 8 to 12 bullets, each begins with '-' and is implementable.\n"
-    "- Include evidence_snippets: 3 to 6 short quotes from context (<=200 chars each).\n\n"
+    "- summary MUST be 6 to 8 bullets.\n"
+    "- recommended_actions MUST be 6 to 8 bullets, each is implementable.\n"
+    "- Include evidence_snippets: 2 to 4 short quotes from context (<=200 chars each).\n\n"
     "Return ONLY valid JSON inside the markers.\n"
     "Do not add extra keys.\n\n"
     "If you cannot comply perfectly, output this fallback JSON inside the markers:\n"
     "<<<JSON>>>\n"
-    "{\"title\":\"\",\"summary\":\"\",\"category\":\"other\",\"affected_signals\":[],"
+    "{\"title\":\"\",\"summary\":[],\"category\":\"other\",\"affected_signals\":[],"
     "\"recommended_actions\":[],\"risk_score\":2,\"confidence\":0.65,\"evidence_snippets\":[]}\n"
     "<<<ENDJSON>>>"
 )
@@ -95,15 +95,16 @@ def _tags(ev: Dict[str, Any], max_items: int = 12) -> List[str]:
 
 
 def build_deep_insight_prompt(url: str, title: str, summary: str, context: str, baseline: bool) -> str:
+    # IMPORTANT: Keep schema aligned with how we parse later (lists, not newline-joined strings).
     schema = {
         "title": "string (specific, include feature or policy name when possible)",
-        "summary": "string (10-14 bullets, each starts with '-', bullet lines separated by \\n)",
+        "summary": ["string (6-8 bullets, each starts with '-')"],
         "category": "string (vulnerability_intel | policy_intel | api_signal_change | enforcement_change | telemetry_change | other)",
         "affected_signals": ["string (up to 8, specific signals or controls)"],
-        "recommended_actions": ["string (8-12 bullets, each starts with '-')"],
+        "recommended_actions": ["string (6-8 bullets, each starts with '-')"],
         "risk_score": "integer 1-5",
         "confidence": "number 0-1",
-        "evidence_snippets": ["string (3-6 quotes from context, <=200 chars each)"],
+        "evidence_snippets": ["string (2-4 quotes from context, <=200 chars each)"],
     }
 
     mode = "BASELINE_INTELLIGENCE" if baseline else "UPDATE_INTELLIGENCE"
@@ -119,7 +120,8 @@ def build_deep_insight_prompt(url: str, title: str, summary: str, context: str, 
         "Propose monitoring and validation steps to detect future drift.\n"
         "- If MODE is UPDATE_INTELLIGENCE: explain what changed and how it could affect monitoring coverage and risk decisions.\n"
         "- Make recommendations implementable. Prefer concrete checks, alerts, rules, thresholds, and validation steps.\n\n"
-        f"CONTEXT (RAG snippets):\n{context[:9000]}\n\n"
+        # Smaller context reduces drift and truncation.
+        f"CONTEXT (RAG snippets):\n{context[:4500]}\n\n"
         "Return JSON only inside the markers described in the system instructions.\n"
         "Do not add extra keys.\n"
         f"Schema:\n{schema}"
@@ -131,7 +133,8 @@ def rag_context_from_event(title: str, summary: str, text: str, top_k: int) -> s
     if not t:
         return ""
 
-    q = (f"{title}\n{summary}\n{t[:1400]}").strip()[:1800]
+    # Smaller query reduces irrelevant retrieval while keeping intent.
+    q = (f"{title}\n{summary}\n{t[:1000]}").strip()[:1500]
     q_emb = embed_texts([q])[0]
 
     resp = vector_search(query_embedding=q_emb, match_count=top_k, filter_source_id=None, filter_kind=None)
@@ -141,15 +144,20 @@ def rag_context_from_event(title: str, summary: str, text: str, top_k: int) -> s
     for r in rows[:top_k]:
         chunk = (r.get("chunk_text") or "").strip()
         if chunk:
-            out.append(chunk[:1200])
+            out.append(chunk[:700])
 
     return "\n\n---\n\n".join(out)
 
 
 def main() -> int:
     agent_name = os.getenv("AGENT_NAME", "coordinator")
-    model = os.getenv("MODEL_ANALYZE", "meta/llama3-8b-instruct")
-    top_k = int(os.getenv("RAG_TOP_K", "6"))
+
+    # Stronger default model for JSON contract adherence
+    model = os.getenv("MODEL_ANALYZE", "meta/llama3-70b-instruct")
+
+    # Slightly lower retrieval breadth to reduce context size
+    top_k = int(os.getenv("RAG_TOP_K", "4"))
+
     max_recs = int(os.getenv("MAX_RECOMMENDATIONS", "8"))
 
     debug = str(os.getenv("DEBUG_LLM", "")).strip().lower() in ("1", "true", "yes", "y")
@@ -218,13 +226,21 @@ def main() -> int:
                 )
 
                 affected = _as_list_str(out.get("affected_signals"), max_items=8, max_len=160) or []
-                actions = _as_list_str(out.get("recommended_actions"), max_items=12, max_len=280) or []
-                evidence = _as_list_str(out.get("evidence_snippets"), max_items=6, max_len=200) or []
+                actions = _as_list_str(out.get("recommended_actions"), max_items=8, max_len=280) or []
+                evidence = _as_list_str(out.get("evidence_snippets"), max_items=4, max_len=200) or []
+
                 risk_score = _as_int(out.get("risk_score"), 2)
                 confidence = _as_float(out.get("confidence"), 0.65)
 
                 insight_title = str(out.get("title") or title)[:240]
-                insight_summary = str(out.get("summary") or ev_summary)[:6000]
+
+                # summary is now expected as list[str]; if model returns string, fall back safely
+                summary_list = _as_list_str(out.get("summary"), max_items=8, max_len=420)
+                if summary_list:
+                    insight_summary = "\n".join(summary_list)[:6000]
+                else:
+                    insight_summary = str(out.get("summary") or ev_summary)[:6000]
+
                 category = out.get("category")
                 category = str(category).strip()[:140] if category else None
 
@@ -234,7 +250,7 @@ def main() -> int:
                 rationale_parts: List[str] = [insight_summary]
                 if evidence:
                     rationale_parts.append("Evidence:")
-                    for q in evidence[:6]:
+                    for q in evidence[:4]:
                         rationale_parts.append(f"- {q}")
                 rationale = "\n".join(rationale_parts)[:8000]
 
@@ -292,7 +308,9 @@ def main() -> int:
                 )
 
                 if debug:
-                    print(f"[COORD] event_id={ev_id} wrote priority={priority} actions={len(actions)} evidence={len(evidence)}")
+                    print(
+                        f"[COORD] event_id={ev_id} wrote priority={priority} actions={len(actions)} evidence={len(evidence)}"
+                    )
 
             except Exception as e:
                 stats["errors"] += 1
