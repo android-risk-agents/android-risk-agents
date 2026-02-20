@@ -32,14 +32,55 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _remove_illegal_control_chars(s: str) -> str:
-    """
-    Remove ASCII control chars that break JSON parsing:
-    - Remove 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
-    Keep tab/newline/CR because they may appear legitimately.
-    """
+    # Remove: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
     if not s:
         return s
     return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+
+
+def _escape_newlines_inside_strings(s: str) -> str:
+    """
+    Convert raw newline / carriage-return characters to escaped sequences ONLY when
+    we are inside a quoted JSON string. This fixes "Invalid control character" from
+    models that emit multi-line strings.
+    """
+    if not s:
+        return s
+
+    out: list[str] = []
+    in_str = False
+    esc = False
+
+    for ch in s:
+        if esc:
+            out.append(ch)
+            esc = False
+            continue
+
+        if ch == "\\":
+            out.append(ch)
+            esc = True
+            continue
+
+        if ch == '"':
+            out.append(ch)
+            in_str = not in_str
+            continue
+
+        if in_str:
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+
+        out.append(ch)
+
+    return "".join(out)
 
 
 def _unwrap_singleton_list(obj: Any) -> Any:
@@ -50,11 +91,12 @@ def _unwrap_singleton_list(obj: Any) -> Any:
 
 def _extract_first_json_obj(text: str) -> Dict[str, Any]:
     t = _strip_code_fences(text)
-    t = _remove_illegal_control_chars(t).strip()
+    t = _remove_illegal_control_chars(t)
+    t = t.strip()
     if not t:
         return {}
 
-    # Try direct parse
+    # Try direct parse first
     try:
         obj = json.loads(t)
         obj = _unwrap_singleton_list(obj)
@@ -66,17 +108,32 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Fix common model issue: multiline strings
+    t2 = _escape_newlines_inside_strings(t)
+
+    # Try again
+    try:
+        obj = json.loads(t2)
+        obj = _unwrap_singleton_list(obj)
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            return obj[0]
+        return {}
+    except Exception:
+        pass
+
     # raw_decode: find first { or [
-    start_obj = t.find("{")
-    start_arr = t.find("[")
+    start_obj = t2.find("{")
+    start_arr = t2.find("[")
     if start_obj == -1 and start_arr == -1:
         raise ValueError("No JSON object found in model output.")
 
     start = start_obj if start_arr == -1 else (start_arr if start_obj == -1 else min(start_obj, start_arr))
-    t2 = t[start:]
+    t3 = t2[start:]
 
     dec = json.JSONDecoder()
-    obj, _idx = dec.raw_decode(t2)
+    obj, _idx = dec.raw_decode(t3)
     obj = _unwrap_singleton_list(obj)
 
     if isinstance(obj, dict):
@@ -134,32 +191,20 @@ class NimClient:
                     print(f"[NIM] status={resp.status_code} attempt={attempt} rid={rid}")
 
                 if resp.status_code >= 400:
-                    head = resp.text[:800] if resp.text else ""
-                    last_err = f"HTTP {resp.status_code}: {head}"
+                    head = (resp.text or "")[:900]
+                    head = _remove_illegal_control_chars(head)
                     if self.debug:
-                        print(f"[NIM] http_error_head rid={rid}: {_remove_illegal_control_chars(head)}")
+                        print(f"[NIM] http_error_head rid={rid}: {head}")
+                    last_err = f"HTTP {resp.status_code}: {head}"
                     time.sleep(0.8 * attempt)
                     continue
 
-                # IMPORTANT: do NOT use resp.json() directly
                 raw_text = resp.text or ""
-                raw_head = _remove_illegal_control_chars(raw_text[:900])
-
                 if self.debug:
-                    print(f"[NIM] resp_text_head rid={rid}: {raw_head}")
+                    print(f"[NIM] resp_text_head rid={rid}: {_remove_illegal_control_chars(raw_text[:900])}")
 
                 clean_text = _remove_illegal_control_chars(raw_text)
-
-                try:
-                    data = json.loads(clean_text)
-                except Exception as e:
-                    # This is the error you are seeing. Log more context.
-                    if self.debug:
-                        print(f"[NIM] outer_json_parse_error rid={rid}: {str(e)[:300]}")
-                        print(f"[NIM] outer_json_parse_head rid={rid}: {raw_head}")
-                    last_err = str(e)
-                    time.sleep(0.8 * attempt)
-                    continue
+                data = json.loads(clean_text)
 
                 content = (
                     (((data.get("choices") or [{}])[0]).get("message") or {}).get("content")
@@ -167,8 +212,7 @@ class NimClient:
                 )
 
                 if self.debug:
-                    c_head = _remove_illegal_control_chars(content)[:900]
-                    print(f"[NIM] content_head rid={rid}: {c_head}")
+                    print(f"[NIM] content_head rid={rid}: {_remove_illegal_control_chars(content)[:900]}")
 
                 parsed = _extract_first_json_obj(content)
 
