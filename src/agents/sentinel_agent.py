@@ -36,8 +36,10 @@ def call_vllm_json(prompt: str, base_url: str, model: str) -> str:
     Calls the vLLM OpenAI-compatible endpoint directly using the requests library.
     Requests strictly JSON output from the model.
     """
-    url = f"{base_url.rstrip('/')}/v1/chat/completions"
-    
+    base_url = base_url.rstrip('/')
+    if not base_url.endswith('/v1'):
+        base_url = f"{base_url}/v1"
+    url = f"{base_url}/chat/completions"
     headers = {
         "Content-Type": "application/json"
     }
