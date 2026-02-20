@@ -33,15 +33,12 @@ def _strip_code_fences(s: str) -> str:
 
 def _remove_illegal_control_chars(s: str) -> str:
     """
-    JSON does not allow certain ASCII control chars unescaped inside strings.
-    We remove the illegal ones to avoid: Invalid control character at ...
-    Keep: tab(0x09), newline(0x0A), carriage return(0x0D) because they are valid
-    when represented properly. If they appear unescaped, removing illegal ones
-    still helps most malformed outputs.
+    Remove ASCII control chars that break JSON parsing:
+    - Remove 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
+    Keep tab/newline/CR because they may appear legitimately.
     """
     if not s:
         return s
-    # Remove: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
     return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
 
 
@@ -52,16 +49,12 @@ def _unwrap_singleton_list(obj: Any) -> Any:
 
 
 def _extract_first_json_obj(text: str) -> Dict[str, Any]:
-    """
-    Extract the first JSON object/array from a string, using JSONDecoder.raw_decode,
-    after stripping code fences and removing illegal control chars.
-    """
     t = _strip_code_fences(text)
     t = _remove_illegal_control_chars(t).strip()
     if not t:
         return {}
 
-    # Fast path: exact JSON
+    # Try direct parse
     try:
         obj = json.loads(t)
         obj = _unwrap_singleton_list(obj)
@@ -73,7 +66,7 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # raw_decode path: find first { or [
+    # raw_decode: find first { or [
     start_obj = t.find("{")
     start_arr = t.find("[")
     if start_obj == -1 and start_arr == -1:
@@ -95,10 +88,6 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
 
 @dataclass
 class NimClient:
-    """
-    NVIDIA NIM client. Endpoint and model are hardcoded for testing.
-    Only NVIDIA_API_KEY is required as env.
-    """
     base_url: str = "https://integrate.api.nvidia.com/v1"
     timeout_s: int = 60
     max_retries: int = 3
@@ -119,14 +108,12 @@ class NimClient:
         max_tokens: int = 600,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Calls NIM chat.completions and returns a parsed JSON dict.
-        """
         rid = request_id or "req"
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
         payload = {
             "model": model,
@@ -139,6 +126,7 @@ class NimClient:
         }
 
         last_err: Optional[str] = None
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_s)
@@ -146,19 +134,41 @@ class NimClient:
                     print(f"[NIM] status={resp.status_code} attempt={attempt} rid={rid}")
 
                 if resp.status_code >= 400:
-                    last_err = f"HTTP {resp.status_code}: {resp.text[:500]}"
+                    head = resp.text[:800] if resp.text else ""
+                    last_err = f"HTTP {resp.status_code}: {head}"
+                    if self.debug:
+                        print(f"[NIM] http_error_head rid={rid}: {_remove_illegal_control_chars(head)}")
                     time.sleep(0.8 * attempt)
                     continue
 
-                data = resp.json()
+                # IMPORTANT: do NOT use resp.json() directly
+                raw_text = resp.text or ""
+                raw_head = _remove_illegal_control_chars(raw_text[:900])
+
+                if self.debug:
+                    print(f"[NIM] resp_text_head rid={rid}: {raw_head}")
+
+                clean_text = _remove_illegal_control_chars(raw_text)
+
+                try:
+                    data = json.loads(clean_text)
+                except Exception as e:
+                    # This is the error you are seeing. Log more context.
+                    if self.debug:
+                        print(f"[NIM] outer_json_parse_error rid={rid}: {str(e)[:300]}")
+                        print(f"[NIM] outer_json_parse_head rid={rid}: {raw_head}")
+                    last_err = str(e)
+                    time.sleep(0.8 * attempt)
+                    continue
+
                 content = (
                     (((data.get("choices") or [{}])[0]).get("message") or {}).get("content")
                     or ""
                 )
 
                 if self.debug:
-                    head = _remove_illegal_control_chars(content)[:800]
-                    print(f"[NIM] content_head rid={rid}: {head}")
+                    c_head = _remove_illegal_control_chars(content)[:900]
+                    print(f"[NIM] content_head rid={rid}: {c_head}")
 
                 parsed = _extract_first_json_obj(content)
 
@@ -169,6 +179,8 @@ class NimClient:
 
             except Exception as e:
                 last_err = str(e)
+                if self.debug:
+                    print(f"[NIM] exception rid={rid}: {last_err[:400]}")
                 time.sleep(0.8 * attempt)
 
         raise RuntimeError(f"NIM request failed after {self.max_retries} attempts: {last_err}")
