@@ -37,7 +37,7 @@ SYSTEM_TRIAGE = """You are the Sentinel Triage Agent, an expert in Android and d
 Your job is to compare an OLD snapshot text with a NEW snapshot text and decide its relevance to fraud, malware, security, or compliance risk.
 
 CRITICAL INSTRUCTIONS:
-1. Be strict but prefer FALSE NEGATIVES (if unsure, flag it).
+1. Be conservative: if unsure, set decision to 'needs_review' (do not ignore uncertain items).
 2. You MUST output your response in strictly valid JSON format.
 3. Provide absolutely NO markdown formatting, NO conversational text, and NO markdown code fences (like ```json). Just the raw JSON object.
 4. If this is a BASELINE analysis, you MUST set the decision to "triage" and relevance_score >= 0.75, because fresh runs must always be recorded.
@@ -138,6 +138,11 @@ def parse_and_validate_triage_json(raw_text: str, fallback_change_id: int) -> Di
     category = parsed.get("category", "general")
     if not isinstance(category, str):
         category = "general"
+    else:
+        category = category.lower()
+        valid_categories = {"permissions", "device integrity", "policy", "network", "malware", "auth", "general"}
+        if category not in valid_categories:
+            category = "general"
 
     # Enforce constraints and return the structured schema
     return {
@@ -186,7 +191,7 @@ def call_vllm_json(prompt: str, base_url: str, model: str) -> str:
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.0,
-        "max_tokens": 400
+        "max_tokens": 1000
     }
 
     response = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -247,6 +252,13 @@ def main():
             try:
                 raw_llm_json = call_vllm_json(user_prompt, vllm_base_url, vllm_model)
                 parsed_result = parse_and_validate_triage_json(raw_llm_json, fallback_change_id=change_id)
+                
+                # Fix 2: Enforce baseline rule in code
+                if baseline:
+                    parsed_result["decision"] = "triage"
+                    if parsed_result["relevance_score"] < 0.75:
+                        parsed_result["relevance_score"] = 0.75
+                        
             except requests.exceptions.RequestException as e:
                 logger.error(f"vLLM Network Error on change {change_id}: {e}")
                 stats["errors"] += 1
