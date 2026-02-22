@@ -41,7 +41,7 @@ CRITICAL INSTRUCTIONS:
 2. You MUST output your response in strictly valid JSON format.
 3. Provide absolutely NO markdown formatting, NO conversational text, and NO markdown code fences (like ```json). Just the raw JSON object.
 4. If this is a BASELINE analysis, you MUST set the decision to "triage" and relevance_score >= 0.75, because fresh runs must always be recorded.
-5. Provide a detailed 6-10 line or bulleted summary in the rationale. The Coordinator Agent heavily relies on this summary for actionable insights.
+5. Provide a 3-4 sentence summary in the rationale. The Coordinator Agent heavily relies on this summary for actionable insights.
 6. Use exactly this JSON schema:
 
 {
@@ -52,7 +52,7 @@ CRITICAL INSTRUCTIONS:
   "tags": [<list of up to 8 short lowercase string tags>],
   "category": <string, one of: permissions, device integrity, policy, network, malware, auth, general>,
   "decision": <string, exactly one of: "triage", "ignore", "needs_review">,
-  "rationale": <string, a detailed 6-10 line or bulleted summary of your findings. This summary will be used directly by the coordinator agent as context for actionable insights. Make it comprehensive.>
+  "rationale": <string, a 3-4 sentence summary of your findings. This summary will be used directly by the coordinator agent as context for actionable insights. Make it comprehensive.>
 }
 """
 
@@ -226,7 +226,7 @@ def main():
                     system=SYSTEM_TRIAGE,
                     user=user_prompt,
                     temperature=0.0,
-                    max_tokens=350
+                    max_tokens=400
                 )
                 raw_llm_json = json.dumps(raw_llm_dict)
                 parsed_result = parse_and_validate_triage_json(raw_llm_json, fallback_change_id=change_id)
