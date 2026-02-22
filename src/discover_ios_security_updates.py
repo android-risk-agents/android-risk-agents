@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .db import get_supabase_client
-from .config import USER_AGENT
+from .data_engine.config import USER_AGENT
 
 HEADERS = {"User-Agent": USER_AGENT}
 
