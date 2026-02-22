@@ -5,12 +5,26 @@ from .embedder import embed_texts, MODEL_CHOICE
 
 # The "Golden Dataset"
 # 10 test questions mapping to the expected Android risk ecosystem data
+# The "Golden Dataset"
+# 10 rigorous semantic test questions mapping to the Android risk ecosystem
 TEST_QUESTIONS = [
-    {"query": "What are the rules regarding restricted content and malware?", "keyword": "malware"},
-    {"query": "How does the Play Integrity API protect applications?", "keyword": "integrity"},
-    {"query": "What recent vulnerabilities have been added to the CISA catalog?", "keyword": "cisa"},
-    {"query": "Are there any critical security patches for the Android framework?", "keyword": "framework"},
-    {"query": "What happens if a developer violates the impersonation policy?", "keyword": "impersonation"},
+    # --- Category 1: Google Play Policy (Testing Conceptual Semantic Matching) ---
+    {"query": "Is it allowed to offer users in-game currency or cash in exchange for a 5-star rating on the Play Store?", "keyword": "incentivized"},
+    {"query": "If my app allows users to create AI-generated deepfakes of public figures, what specific rules must I follow?", "keyword": "manipulated media"},
+    {"query": "Can an app download executable code directly from our company's private server instead of the Play Store?", "keyword": "malicious behavior"},
+    {"query": "What happens if a developer uses a prominent politician's face in their app icon without permission?", "keyword": "impersonation"},
+
+    # --- Category 2: Android Security Bulletins (Testing Technical Granularity) ---
+    {"query": "What is the severity of the latest elevation of privilege bugs found in the Qualcomm closed-source components?", "keyword": "qualcomm"},
+    {"query": "Which Android Security Patch Level (SPL) string is required to address the vulnerabilities disclosed in February 2025?", "keyword": "patch level"},
+    {"query": "Are there any critical remote code execution flaws affecting the System or Framework components?", "keyword": "remote code execution"},
+
+    # --- Category 3: CISA KEV Catalog (Testing Dynamic JSON & Threat Intel) ---
+    {"query": "Which specific vulnerabilities are currently being actively exploited in the wild on Android devices?", "keyword": "cve-"},
+    
+    # --- Category 4: Play Integrity API (Testing Developer Documentation) ---
+    {"query": "How can I programmatically verify if a user's device has been rooted or compromised before processing a financial transaction?", "keyword": "verdict"},
+    {"query": "What specific API should a game developer call to defend against unauthorized APK modifications and bot traffic?", "keyword": "play integrity"}
 ]
 
 def evaluate_hit_rate():
