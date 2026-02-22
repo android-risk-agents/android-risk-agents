@@ -23,23 +23,27 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _delta_added_text(old_text: str, new_text: str, max_chars: int = 12000) -> str:
+def _delta_added_text(old_text: str, new_text: str) -> str:
+    """
+    Optimized diffing using unified_diff. 
+    Orders of magnitude faster than ndiff for large documents.
+    """
     old_lines = (old_text or "").splitlines()
     new_lines = (new_text or "").splitlines()
 
+    # n=0 means we don't return unchanged context lines, just the raw differences
+    diff = difflib.unified_diff(old_lines, new_lines, n=0, lineterm="")
+    
     out_lines: List[str] = []
-    for ln in difflib.ndiff(old_lines, new_lines):
-        if ln.startswith("+ "):
-            out_lines.append(ln[2:])
+    for ln in diff:
+        # Ignore diff metadata headers (+++, ---, @@)
+        if ln.startswith("+") and not ln.startswith("+++"):
+            # Strip the leading '+' and save the actual text
+            added_text = ln[1:].strip()
+            if added_text:
+                out_lines.append(added_text)
 
-    delta = "\n".join(out_lines).strip()
-    if not delta:
-        return ""
-
-    if len(delta) > max_chars:
-        delta = delta[: int(max_chars * 0.8)] + "\n\n[.delta truncated.]\n\n" + delta[-int(max_chars * 0.2) :]
-
-    return delta
+    return "\n".join(out_lines).strip()
 
 
 def _embed_delta(source_id_int: int, snapshot_id: int, snapshot_sha: str, delta_text: str) -> int:
@@ -48,20 +52,20 @@ def _embed_delta(source_id_int: int, snapshot_id: int, snapshot_sha: str, delta_
         return 0
 
     embs = embed_texts(chunks)
-    rows: List[Dict[str, Any]] = []
-    for i, (ch, emb) in enumerate(zip(chunks, embs)):
-        rows.append(
-            {
-                "source_id": str(source_id_int),
-                "snapshot_sha": str(snapshot_sha),
-                "kind": "delta",
-                "chunk_index": int(i),
-                "chunk_text": ch,
-                "embedding": emb,
-                "source_id_int": int(source_id_int),
-                "snapshot_id": int(snapshot_id),
-            }
-        )
+    rows: List[Dict[str, Any]] = [
+        {
+            "source_id": str(source_id_int),
+            "snapshot_sha": str(snapshot_sha),
+            "kind": "delta",
+            "chunk_index": int(i),
+            "chunk_text": ch,
+            "embedding": emb,
+            "source_id_int": int(source_id_int),
+            "snapshot_id": int(snapshot_id),
+        }
+        for i, (ch, emb) in enumerate(zip(chunks, embs))
+    ]
+    
     upsert_vector_chunks(rows)
     return len(rows)
 
@@ -98,21 +102,22 @@ def main():
         if not snaps:
             continue
 
-        # 1 snapshot only: baseline-init change (prev_snapshot_id = NULL)
+        # 1. Handle Baseline Initialization (Only 1 snapshot exists)
         if len(snaps) == 1:
             if not INIT_BASELINE_AS_CHANGE:
                 continue
 
             if baseline_created >= BASELINE_MAX_SOURCES:
-                print(f"Baseline-init cap reached ({BASELINE_MAX_SOURCES}). Skipping remaining.", flush=True)
-                break
+                # FIX: Use 'continue' instead of 'break' so we don't skip evaluating 
+                # REAL changes in subsequent sources just because we hit the baseline cap.
+                continue
 
             latest = snaps[0]
             latest_id = int(latest["id"])
 
             payload = {
                 "source_id": src_id,
-                "prev_snapshot_id": None,  # clean baseline init
+                "prev_snapshot_id": None, 
                 "new_snapshot_id": latest_id,
                 "diff_json": {
                     "type": "baseline_init",
@@ -122,14 +127,18 @@ def main():
                 "status": "new",
             }
 
-            sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
-            baseline_created += 1
-            print(f"🟦 Baseline-init change created for {name}", flush=True)
+            try:
+                sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
+                baseline_created += 1
+                print(f"🟦 Baseline-init change created for {name}", flush=True)
+            except Exception as e:
+                print(f"❌ Failed to create baseline for {name}: {e}", flush=True)
             continue
 
-        # Normal case: two snapshots exist
+        # 2. Handle Normal Content Changes (2 snapshots exist)
         latest, previous = snaps
 
+        # If hashes match, nothing changed. Move to next source.
         if latest["content_hash"] == previous["content_hash"]:
             continue
 
@@ -146,19 +155,25 @@ def main():
             "status": "new",
         }
 
-        sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
-        print(f"🚨 Change detected for {name}", flush=True)
+        try:
+            sb.table("changes").upsert(payload, on_conflict="source_id,new_snapshot_id").execute()
+            print(f"🚨 Change detected for {name}", flush=True)
+        except Exception as e:
+            print(f"❌ Failed to record change for {name}: {e}", flush=True)
+            continue # If we can't record the change, don't try to embed the delta
 
         if not EMBED_DELTAS_ON_CHANGE:
             continue
 
+        # 3. Extract and Embed the Delta
         try:
             old_text, _old_hash = get_snapshot_text_and_hash_by_id(int(previous["id"]))
             new_text, new_hash = get_snapshot_text_and_hash_by_id(int(latest["id"]))
+            
             delta = _delta_added_text(old_text, new_text)
 
             if not delta:
-                print(f"No delta text extracted for {name} (hash changed, delta empty).", flush=True)
+                print(f"⏩ No actual text added for {name} (formatting/deletion only).", flush=True)
                 continue
 
             nvec = _embed_delta(
@@ -167,12 +182,12 @@ def main():
                 snapshot_sha=new_hash,
                 delta_text=delta,
             )
-            print(f"Embedded {nvec} delta chunks for {name}", flush=True)
+            print(f"✨ Embedded {nvec} delta chunks for {name}", flush=True)
 
         except Exception as e:
-            print(f"Delta embed failed for {name}: {e}", flush=True)
+            print(f"❌ Delta embed failed for {name}: {e}", flush=True)
 
-    print(f"✅ detect_changes done. baseline_init_created={baseline_created}", flush=True)
+    print(f"\n✅ detect_changes done. baseline_init_created={baseline_created}", flush=True)
 
 
 if __name__ == "__main__":
