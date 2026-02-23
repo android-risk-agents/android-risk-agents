@@ -1,52 +1,77 @@
 import os
 from typing import List
+
+# Import Vertex AI
+import vertexai
+from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
+
+# Existing imports
 from sentence_transformers import SentenceTransformer
 
-# Read the model choice from your .env file
-# Choices: 'baai_small' (384), 'baai_base' (768), 'nomic' (768)
-MODEL_CHOICE = os.getenv("EMBEDDING_MODEL", "baai_small").lower()
-
-if MODEL_CHOICE == "nomic":
-    # 768 Dimensions - Optimized for long context (8k tokens)
-    _model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
-elif MODEL_CHOICE == "baai_base":
-    # 768 Dimensions - The upgraded BAAI baseline
-    _model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-else:
-    # 384 Dimensions - The original MVP baseline
-    _model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
-    if not texts:
-        return []
-    
-    # Nomic strictly requires task prefixes
-    if MODEL_CHOICE == "nomic":
-        prefix = "search_query: " if is_query else "search_document: "
-        processed_texts = [prefix + t for t in texts]
-    else:
-        # BAAI models also benefit from query instructions
-        # but technically only need them for the 'query' side
-        prefix = "Represent this sentence for searching relevant passages: " if is_query else ""
-        processed_texts = [prefix + t for t in texts]
-        
-    return _model.encode(processed_texts, normalize_embeddings=True).tolist()
+MODEL_CHOICE = os.getenv("EMBEDDING_MODEL", "baai").lower()
 
 def chunk_text(text: str, chunk_size_chars: int = 1600, overlap_chars: int = 200) -> List[str]:
-    t = (text or "").strip()
-    if not t:
+    """
+    Splits a large document into smaller chunks for the embedding model.
+    Maintains a 200-character overlap so semantic meaning isn't lost between chunks.
+    """
+    if not text:
         return []
-    if chunk_size_chars <= 0:
-        return [t]
-    chunks: List[str] = []
+        
+    chunks = []
     start = 0
-    n = len(t)
-    while start < n:
-        end = min(n, start + chunk_size_chars)
-        chunk = t[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= n:
+    text_length = len(text)
+    
+    while start < text_length:
+        end = min(start + chunk_size_chars, text_length)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        
+        # If we've reached the end of the text, stop
+        if end == text_length:
             break
-        start = max(0, end - overlap_chars)
+            
+        # Move the start forward, but step back by 'overlap_chars' to create the bridge
+        start += (chunk_size_chars - overlap_chars)
+        
     return chunks
+
+def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
+    """
+    Routes the text to the selected embedding model.
+    """
+    if not texts:
+        return []
+
+    if MODEL_CHOICE == "vertex":
+        # Initialize Vertex AI connection
+        project_id = os.getenv("GCP_PROJECT_ID")
+        location = os.getenv("GCP_LOCATION", "us-central1")
+        vertexai.init(project=project_id, location=location)
+        
+        # Load the 768-dimension model
+        model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+        
+        # Tell Vertex exactly what we are embedding to optimize the vector placement
+        task_type = "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT"
+        
+        # Google's API requires a list of TextEmbeddingInput objects
+        inputs = [TextEmbeddingInput(text=t, task_type=task_type) for t in texts]
+        
+        # Fetch embeddings
+        embeddings = model.get_embeddings(inputs)
+        return [emb.values for emb in embeddings]
+
+    elif MODEL_CHOICE == "nomic":
+        # Nomic MoE logic
+        model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+        prefix = "search_query: " if is_query else "search_document: "
+        prefixed_texts = [prefix + t for t in texts]
+        return model.encode(prefixed_texts).tolist()
+
+    else:
+        # BAAI-Base logic (Default)
+        model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+        if is_query:
+            texts = ["Represent this sentence for searching relevant passages: " + t for t in texts]
+        return model.encode(texts).tolist()

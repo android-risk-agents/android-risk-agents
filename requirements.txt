@@ -1,14 +1,25 @@
-python-dotenv
-requests
-beautifulsoup4
-lxml
-readability-lxml
+# --- Core Environment ---
+python-dotenv==1.0.1
+urllib3<2  # Downgraded to v1.x to fix macOS LibreSSL compatibility
 
-supabase
-openai>=1.40.0
+# --- Web Scraping & Text Extraction ---
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
 
-# embeddings / RAG
-sentence-transformers>=2.6.0
-torch>=2.2.0
+# --- Database & Storage ---
+supabase==2.4.0
+postgrest==0.10.10
 
-huggingface_hub>=0.24.0
+# --- NLP & Embeddings (BAAI / Nomic) ---
+sentence-transformers==2.5.1
+torch==2.2.1
+numpy==1.26.4
+scikit-learn==1.4.1.post1
+einops==0.7.0
+
+# --- Google Cloud / Vertex AI ---
+google-cloud-aiplatform==1.80.0
+
+# --- Utilities ---
+typing-extensions==4.10.0

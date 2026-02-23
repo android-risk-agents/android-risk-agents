@@ -15,7 +15,8 @@ SOURCES = [
     {"name": "CISA KEV Catalog", "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", "fetch_type": "html"},
     
     {"name": "Android Security Bulletins-Feb", "url": "https://source.android.com/docs/security/bulletin/2025-02-01", "fetch_type": "html"},
-    {"name": "Android Security Bulletins-Jan", "url": "https://source.android.com/docs/security/bulletin/2025-01-01", "fetch_type": "html"}
+    {"name": "Android Security Bulletins-Jan", "url": "https://source.android.com/docs/security/bulletin/2025-01-01", "fetch_type": "html"},
+    {"name": "Android Security Bulletins-Jan", "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog", "fetch_type": "html"}
 ]
 
 def main():
