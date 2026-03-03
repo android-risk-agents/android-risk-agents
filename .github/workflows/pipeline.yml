@@ -1,50 +1,119 @@
-name: Android Risk Agents (Agents Only)
+name: Android Risk Agents Pipeline (Agentic)
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: android-risk-agents-agents-only
+  group: android-risk-agents-pipeline
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
+    # Keep embedding/vector config consistent across ALL steps
     env:
-      DEBUG_LLM: "true"           # remove after it works
-      TRIAGE_THRESHOLD: "0.70"
+      EMBEDDING_MODEL: "nomic"                 # baai_small | baai_base | nomic
+      VECTOR_DIM: "768"                       # 384 for baai_small, 768 for nomic/baai_base
+      VECTOR_TABLE: "vector_chunks"           # or "vector_chunks_768"
+      VECTOR_RPC_MATCH: "match_vector_chunks" # or "match_vector_chunks_768"
+
+      USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
+
+      EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
+      EMBED_DELTAS_ON_CHANGE: "true"
+
+      # First-run demo behavior
+      INIT_BASELINE_AS_CHANGE: "true"
+      BASELINE_MAX_SOURCES: "10"
+
+      AGENT_NAME_TRIAGE: "sentinel-triage"
+      AGENT_NAME_COORD: "coordinator"
+
       RAG_TOP_K: "6"
       MAX_RECOMMENDATIONS: "8"
 
+      # Agent configs (only non-secret knobs belong here)
+      TRIAGE_THRESHOLD: "0.70"
       MODEL_TRIAGE: "gemma-2-9b-it"
       MODEL_ANALYZE: "gemma-2-9b-it"
 
-    steps:
-      - uses: actions/checkout@v4
+      # LLM debug
+      DEBUG_LLM: "true"
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Cache HF models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Sentinel triage
+      - name: Seed sources (idempotent)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m src.seed_sources
+
+      - name: Discover latest bulletins
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m src.discover_bulletins
+
+      - name: Scrape sources (snapshots + baseline embeddings)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m src.scrape_sources
+
+      - name: Detect changes (changes + delta embeddings + baseline-init changes)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m src.detect_changes
+
+      - name: Sentinel triage agent (agent_events + change fields)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          LLM_BASE_URL: ${{ secrets.NVIDIA_LLM_URL }}
+
+          # ✅ single knob: update this secret when switching endpoints (NIM vs vLLM)
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+
+          AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
+          TRIAGE_THRESHOLD: ${{ env.TRIAGE_THRESHOLD }}
+          MODEL_TRIAGE: ${{ env.MODEL_TRIAGE }}
+          DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_sentinel_triage
 
-      - name: Coordinator
+      - name: Coordinator agent (recommendations + insights)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          LLM_BASE_URL: ${{ secrets.NVIDIA_LLM_URL }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+
+          AGENT_NAME: ${{ env.AGENT_NAME_COORD }}
+          MODEL_ANALYZE: ${{ env.MODEL_ANALYZE }}
+          RAG_TOP_K: ${{ env.RAG_TOP_K }}
+          MAX_RECOMMENDATIONS: ${{ env.MAX_RECOMMENDATIONS }}
+          DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_coordinator
