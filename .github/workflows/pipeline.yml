@@ -88,11 +88,11 @@ jobs:
 
           # ✅ NVIDIA NIM (dev now)
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          # Use a dedicated secret later if you want (e.g., secrets.NVIDIA_LLM_URL)
           LLM_BASE_URL: "https://integrate.api.nvidia.com/v1"
           MODEL_TRIAGE: "gemma-2-9b-it"
 
           AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
-          # Your sentinel code uses TRIAGE_THRESHOLD as float 0-1
           TRIAGE_THRESHOLD: "0.70"
         run: python -m src.agent_sentinel_triage
 
