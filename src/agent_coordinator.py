@@ -18,7 +18,7 @@ from .db import (
     vector_search,
 )
 from .embedder import embed_texts
-from .llm_client import get_llm_client
+from .llm_client import get_llm_client, chat_json  # ✅ CHANGED: import chat_json
 
 
 SYSTEM_ANALYZE = (
@@ -154,19 +154,18 @@ def _chat_json_coordinator(
 ) -> Dict[str, Any]:
     """
     Coordinator-local chat_json to avoid 'Invalid control character' crashes.
+
+    ✅ CHANGED: Instead of OpenAI/Groq-style client.chat.completions.create(),
+    call the shared NIM wrapper chat_json() from llm_client.py.
     """
-    resp = client.chat.completions.create(
+    return chat_json(
+        client=client,
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        system=system,
+        user=user,
         temperature=temperature,
         max_tokens=max_tokens,
     )
-
-    content = resp.choices[0].message.content or ""
-    return _safe_parse_json(content)
 
 
 def build_deep_insight_prompt(url: str, title: str, summary: str, context: str) -> str:
