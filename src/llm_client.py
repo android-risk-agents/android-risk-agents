@@ -42,6 +42,23 @@ def _safe_url_for_logs(full_url: str) -> str:
         return "<url>"
 
 
+def _normalize_model(model: str) -> str:
+    """
+    Allow YAML/env to pass either:
+      - gemma-2-9b-it
+      - google/gemma-2-9b-it
+    """
+    m = (model or "").strip()
+    if not m:
+        return m
+    if "/" in m:
+        return m
+    # gemma models on NIM are under google/*
+    if m.startswith("gemma-"):
+        return f"google/{m}"
+    return m
+
+
 # Precompiled regex for speed
 _RE_ILLEGAL_CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
@@ -255,13 +272,11 @@ class NimClient:
     """
     Minimal OpenAI-compatible client for NVIDIA NIM.
 
-    IMPORTANT:
-    - base_url may be either:
-        https://integrate.api.nvidia.com
-      or
-        https://integrate.api.nvidia.com/v1
-    - We normalize so the final endpoint is always:
-        .../v1/chat/completions
+    base_url may be either:
+      - https://integrate.api.nvidia.com
+      - https://integrate.api.nvidia.com/v1
+    We normalize so the final endpoint is always:
+      .../v1/chat/completions
     """
     base_url: str = "https://integrate.api.nvidia.com/v1"
     timeout_s: int = 60
@@ -285,9 +300,6 @@ class NimClient:
     ) -> Dict[str, Any]:
         rid = request_id or "req"
 
-        # Normalize base_url so both forms work:
-        # - https://integrate.api.nvidia.com
-        # - https://integrate.api.nvidia.com/v1
         base = (self.base_url or "").rstrip("/")
         if base.endswith("/v1"):
             url = f"{base}/chat/completions"
@@ -300,8 +312,10 @@ class NimClient:
             "Accept": "application/json",
         }
 
+        model_id = _normalize_model(model)
+
         payload: Dict[str, Any] = {
-            "model": model,
+            "model": model_id,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -311,11 +325,13 @@ class NimClient:
         }
 
         last_err: Optional[str] = None
+        forced_no_system = False
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 if self.debug:
-                    print(f"[NIM] url={_safe_url_for_logs(url)}")
+                    print(f"[NIM] url={_safe_url_for_logs(url)} model={model_id}")
+                    print(f"[NIM] attempt={attempt} rid={rid} no_system={forced_no_system}")
 
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_s)
 
@@ -326,7 +342,23 @@ class NimClient:
                     head = _remove_illegal_control_chars((resp.text or "")[:900])
                     if self.debug:
                         print(f"[NIM] http_error_head rid={rid}: {head}")
+
                     last_err = f"HTTP {resp.status_code}: {head}"
+
+                    # Safe fallback for backends/models that reject "system" role
+                    if (not forced_no_system) and ("System role not supported" in head):
+                        forced_no_system = True
+                        combined = (
+                            "INSTRUCTIONS:\n"
+                            f"{(system or '').strip()}\n\n"
+                            "TASK:\n"
+                            f"{(user or '').strip()}\n"
+                        )
+                        payload["messages"] = [{"role": "user", "content": combined}]
+                        payload["temperature"] = 0.0
+                        time.sleep(0.4 * attempt)
+                        continue
+
                     time.sleep(0.8 * attempt)
                     continue
 
@@ -393,7 +425,7 @@ class NimClient:
 
 def get_llm_client() -> NimClient:
     """
-    Returns an NVIDIA NIM client using a single configurable secret:
+    Uses a single configurable secret:
       LLM_BASE_URL
     """
     base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")

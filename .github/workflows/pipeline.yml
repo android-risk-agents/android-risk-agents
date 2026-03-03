@@ -36,8 +36,10 @@ jobs:
 
       # Agent configs (only non-secret knobs belong here)
       TRIAGE_THRESHOLD: "0.70"
-      MODEL_TRIAGE: "gemma-2-9b-it"
-      MODEL_ANALYZE: "gemma-2-9b-it"
+
+      # ✅ Use full NIM model ids
+      MODEL_TRIAGE: "google/gemma-2-9b-it"
+      MODEL_ANALYZE: "google/gemma-2-9b-it"
 
       # LLM debug
       DEBUG_LLM: "true"
