@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -22,6 +23,40 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 def _debug_enabled() -> bool:
     return str(os.getenv("DEBUG_LLM", "")).strip().lower() in ("1", "true", "yes", "y")
+
+
+def _safe_url_for_logs(full_url: str) -> str:
+    """
+    GitHub Actions will redact secrets from logs, which can turn URLs into "***".
+    This prints a sanitized host (first 3 + last 3 chars) + full path so you can
+    still verify you're hitting /v1/chat/completions without leaking secrets.
+    """
+    try:
+        p = urlparse(full_url)
+        host = p.hostname or ""
+        path = p.path or ""
+        if len(host) > 6:
+            host = f"{host[:3]}...{host[-3:]}"
+        return f"{p.scheme}://{host}{path}"
+    except Exception:
+        return "<url>"
+
+
+def _normalize_model(model: str) -> str:
+    """
+    Allow YAML/env to pass either:
+      - gemma-2-9b-it
+      - google/gemma-2-9b-it
+    """
+    m = (model or "").strip()
+    if not m:
+        return m
+    if "/" in m:
+        return m
+    # gemma models on NIM are under google/*
+    if m.startswith("gemma-"):
+        return f"google/{m}"
+    return m
 
 
 # Precompiled regex for speed
@@ -49,7 +84,6 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _remove_illegal_control_chars(s: str) -> str:
-    # Remove: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
     if not s:
         return s
     return _RE_ILLEGAL_CTRL.sub("", s)
@@ -58,10 +92,6 @@ def _remove_illegal_control_chars(s: str) -> str:
 def _extract_between_markers(
     text: str, start: str = "<<<JSON>>>", end: str = "<<<ENDJSON>>>"
 ) -> str:
-    """
-    Extract payload between markers.
-    Tolerant to missing start or end marker, which happens with some NIM generations.
-    """
     if not text:
         return text
 
@@ -69,15 +99,12 @@ def _extract_between_markers(
     i = t.find(start)
     j = t.rfind(end)
 
-    # Normal case: both markers exist
     if i != -1 and j != -1 and j > i:
         return t[i + len(start) : j].strip()
 
-    # END exists but START doesn't: strip END and continue
     if i == -1 and j != -1:
         return t[:j].strip()
 
-    # START exists but END doesn't: take everything after START
     if i != -1 and j == -1:
         return t[i + len(start) :].strip()
 
@@ -85,10 +112,6 @@ def _extract_between_markers(
 
 
 def _escape_newlines_inside_strings(s: str) -> str:
-    """
-    Convert raw newline / carriage-return / tab characters to escaped sequences ONLY when
-    we are inside a quoted JSON string. Fixes invalid JSON from multi-line strings.
-    """
     if not s:
         return s
 
@@ -135,62 +158,30 @@ def _unwrap_singleton_list(obj: Any) -> Any:
 
 
 def _extract_json_object_block(s: str) -> str:
-    """
-    Extract a likely JSON OBJECT block (not array):
-    - find first '{'
-    - slice from there
-    - find last '}' and cut there
-
-    This avoids accidentally accepting array-only outputs like:
-      ["Overview", "Setup", "API reference", ...]
-    """
     if not s:
         return s
     s = s.strip()
 
     i = s.find("{")
     if i == -1:
-        return s  # let downstream raise
+        return s
 
     s2 = s[i:]
     end = s2.rfind("}")
     if end == -1:
-        # Possibly truncated response; return what we have
         return s2
-
     return s2[: end + 1]
 
 
 def _repair_common_json_syntax(s: str) -> str:
-    """
-    Repair only very common, low-risk issues LLMs emit.
-    These fixes do not invent content, they only remove illegal punctuation patterns.
-
-    Repairs:
-    - trailing commas before } or ]
-    - stray ',:' before next key or before close or at end
-    - missing comma between a value-ending token and the next key quote
-    - special case: '",: }' or '",: ]'
-    """
     if not s:
         return s
 
-    # Special: "...",: }  -> "..." }
     s = _RE_DANGLING_QUOTE_COMMA_COLON_CLOSE.sub(r'"\1', s)
-
-    # Remove trailing commas: ", }" or ", ]"
     s = _RE_TRAILING_COMMA.sub(r"\1", s)
-
-    # Fix stray comma-colon glitch: ,: "key"
     s = _RE_COMMA_COLON_BEFORE_QUOTE.sub(r", \1", s)
-
-    # Fix stray comma-colon before closing: ,: } or ,: ]
     s = _RE_COMMA_COLON_BEFORE_CLOSE.sub(r"\1", s)
-
-    # Fix stray comma-colon at end of string: ,: <EOF>
     s = _RE_DANGLING_COMMA_COLON_EOF.sub("", s)
-
-    # Insert missing comma between a value-ending token and the next key quote
     s = _RE_MISSING_COMMA_BEFORE_KEY.sub(r"\1, \2", s)
 
     return s
@@ -220,15 +211,6 @@ def _looks_truncated_or_non_object(candidate: str) -> bool:
 
 
 def _prepare_candidate_json(text: str) -> str:
-    """
-    Normalize candidate JSON string:
-    - extract between markers (tolerant)
-    - strip fences
-    - remove illegal control chars
-    - extract likely json OBJECT block
-    - escape newlines inside strings
-    - repair common syntax issues (two passes, deterministic)
-    """
     t = _extract_between_markers(text)
     t = _strip_code_fences(t)
     t = _remove_illegal_control_chars(t)
@@ -236,15 +218,11 @@ def _prepare_candidate_json(text: str) -> str:
     t = _extract_json_object_block(t)
     t = _escape_newlines_inside_strings(t)
     t = _repair_common_json_syntax(t)
-    t = _repair_common_json_syntax(t)  # second deterministic pass
+    t = _repair_common_json_syntax(t)
     return (t or "").strip()
 
 
 def _safe_json_loads(text: str) -> Tuple[Any, Optional[str]]:
-    """
-    Try json.loads with our normalization steps.
-    Returns (obj, error_string). error_string is None on success.
-    """
     candidate = _prepare_candidate_json(text)
     if not candidate:
         return {}, None
@@ -262,16 +240,9 @@ def _safe_json_loads(text: str) -> Tuple[Any, Optional[str]]:
 
 
 def _extract_first_json_obj(text: str) -> Dict[str, Any]:
-    """
-    Extract and parse the first JSON object from model output.
-    Keeps prior functionality:
-    - handles dict
-    - handles singleton list [ { ... } ]
-    - handles list[dict] by returning first dict
-    """
     obj, err = _safe_json_loads(text)
     if err is not None:
-        raise json.JSONDecodeError(err, doc=text or "", pos=0)  # pos not reliable here
+        raise json.JSONDecodeError(err, doc=text or "", pos=0)
 
     obj = _unwrap_singleton_list(obj)
 
@@ -283,13 +254,8 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
 
 
 def _extract_content_from_nim_envelope(raw_text: str) -> str:
-    """
-    NIM returns an OpenAI-compatible envelope JSON. Parse and extract choices[0].message.content.
-    We apply illegal-control cleanup before json.loads to avoid envelope parse failures.
-    """
     cleaned = _remove_illegal_control_chars(raw_text or "")
     data = json.loads(cleaned)
-
     content = (
         (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
     )
@@ -303,6 +269,15 @@ def _extract_content_from_nim_envelope(raw_text: str) -> str:
 
 @dataclass
 class NimClient:
+    """
+    Minimal OpenAI-compatible client for NVIDIA NIM.
+
+    base_url may be either:
+      - https://integrate.api.nvidia.com
+      - https://integrate.api.nvidia.com/v1
+    We normalize so the final endpoint is always:
+      .../v1/chat/completions
+    """
     base_url: str = "https://integrate.api.nvidia.com/v1"
     timeout_s: int = 60
     max_retries: int = 3
@@ -323,40 +298,43 @@ class NimClient:
         max_tokens: int = 1200,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Calls NIM chat/completions and returns parsed JSON from assistant content.
-
-        Reliability layers:
-        - envelope parse with control-char cleanup
-        - marker extraction tolerant to missing start/end
-        - object-only extraction (forces '{ ... }')
-        - safe normalization, newline escaping, low-risk punctuation repairs
-        - truncation/non-object guard (forces retry)
-        - debug context for failures
-        - retries (forces temperature=0 after first parse failure)
-        """
         rid = request_id or "req"
-        url = f"{self.base_url}/chat/completions"
+
+        base = (self.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
 
-        payload = {
-            "model": model,
+        model_id = _normalize_model(model)
+
+        payload: Dict[str, Any] = {
+            "model": model_id,
             "messages": [
-                {"role": "user", "content": f"{system}\n\n{user}"},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
 
         last_err: Optional[str] = None
+        forced_no_system = False
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                if self.debug:
+                    print(f"[NIM] url={_safe_url_for_logs(url)} model={model_id}")
+                    print(f"[NIM] attempt={attempt} rid={rid} no_system={forced_no_system}")
+
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_s)
+
                 if self.debug:
                     print(f"[NIM] status={resp.status_code} attempt={attempt} rid={rid}")
 
@@ -364,13 +342,32 @@ class NimClient:
                     head = _remove_illegal_control_chars((resp.text or "")[:900])
                     if self.debug:
                         print(f"[NIM] http_error_head rid={rid}: {head}")
+
                     last_err = f"HTTP {resp.status_code}: {head}"
+
+                    # Safe fallback for backends/models that reject "system" role
+                    if (not forced_no_system) and ("System role not supported" in head):
+                        forced_no_system = True
+                        combined = (
+                            "INSTRUCTIONS:\n"
+                            f"{(system or '').strip()}\n\n"
+                            "TASK:\n"
+                            f"{(user or '').strip()}\n"
+                        )
+                        payload["messages"] = [{"role": "user", "content": combined}]
+                        payload["temperature"] = 0.0
+                        time.sleep(0.4 * attempt)
+                        continue
+
                     time.sleep(0.8 * attempt)
                     continue
 
                 raw_text = resp.text or ""
                 if self.debug:
-                    print(f"[NIM] resp_text_head rid={rid}: {_remove_illegal_control_chars(raw_text[:900])}")
+                    print(
+                        f"[NIM] resp_text_head rid={rid}: "
+                        f"{_remove_illegal_control_chars(raw_text[:900])}"
+                    )
 
                 # Envelope parse
                 try:
@@ -383,7 +380,10 @@ class NimClient:
                     continue
 
                 if self.debug:
-                    print(f"[NIM] content_head rid={rid}: {_remove_illegal_control_chars(content)[:900]}")
+                    print(
+                        f"[NIM] content_head rid={rid}: "
+                        f"{_remove_illegal_control_chars(content)[:900]}"
+                    )
 
                 # Content parse
                 try:
@@ -413,9 +413,24 @@ class NimClient:
                     print(f"[NIM] exception rid={rid}: {last_err[:400]}")
                 time.sleep(0.8 * attempt)
 
-        raise RuntimeError(f"NIM request failed after {self.max_retries} attempts: {last_err}")
+        raise RuntimeError(
+            f"NIM request failed after {self.max_retries} attempts: {last_err}"
+        )
+
+
+# -----------------------------
+# Public interface used by agents
+# -----------------------------
+
+
 def get_llm_client() -> NimClient:
-    return NimClient()
+    """
+    Uses a single configurable secret:
+      LLM_BASE_URL
+    """
+    base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    return NimClient(base_url=base_url)
+
 
 def chat_json(
     client: NimClient,
@@ -430,5 +445,5 @@ def chat_json(
         system=system,
         user=user,
         temperature=temperature,
-        max_tokens=max_tokens
+        max_tokens=max_tokens,
     )

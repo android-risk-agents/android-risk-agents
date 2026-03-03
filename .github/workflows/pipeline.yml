@@ -12,6 +12,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
+    # Keep embedding/vector config consistent across ALL steps
+    env:
+      EMBEDDING_MODEL: "nomic"                 # baai_small | baai_base | nomic
+      VECTOR_DIM: "768"                       # 384 for baai_small, 768 for nomic/baai_base
+      VECTOR_TABLE: "vector_chunks"           # or "vector_chunks_768"
+      VECTOR_RPC_MATCH: "match_vector_chunks" # or "match_vector_chunks_768"
+
+      USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
+
+      EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
+      EMBED_DELTAS_ON_CHANGE: "true"
+
+      # First-run demo behavior
+      INIT_BASELINE_AS_CHANGE: "true"
+      BASELINE_MAX_SOURCES: "10"
+
+      AGENT_NAME_TRIAGE: "sentinel-triage"
+      AGENT_NAME_COORD: "coordinator"
+
+      RAG_TOP_K: "6"
+      MAX_RECOMMENDATIONS: "8"
+
+      # Agent configs (only non-secret knobs belong here)
+      TRIAGE_THRESHOLD: "0.70"
+
+      # ✅ Use full NIM model ids
+      MODEL_TRIAGE: "google/gemma-2-9b-it"
+      MODEL_ANALYZE: "google/gemma-2-9b-it"
+
+      # LLM debug
+      DEBUG_LLM: "true"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,7 +53,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Cache HuggingFace models (speedup)
       - name: Cache HF models
         uses: actions/cache@v4
         with:
@@ -38,36 +69,24 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
         run: python -m src.seed_sources
 
       - name: Discover latest bulletins
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
         run: python -m src.discover_bulletins
 
       - name: Scrape sources (snapshots + baseline embeddings)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
-
-          VECTOR_DIM: "384"
-          EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
         run: python -m src.scrape_sources
 
       - name: Detect changes (changes + delta embeddings + baseline-init changes)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
-          EMBED_DELTAS_ON_CHANGE: "true"
-
-          # NEW: for first run demo - treat first snapshot as a change
-          INIT_BASELINE_AS_CHANGE: "true"
-          BASELINE_MAX_SOURCES: "10"
         run: python -m src.detect_changes
 
       - name: Sentinel triage agent (agent_events + change fields)
@@ -78,8 +97,13 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           VLLM_MODEL: "google/gemma-2-9b-it"
 
-          AGENT_NAME: "sentinel-triage"
-          RELEVANCE_THRESHOLD: "70"
+          # ✅ single knob: update this secret when switching endpoints (NIM vs vLLM)
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+
+          AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
+          TRIAGE_THRESHOLD: ${{ env.TRIAGE_THRESHOLD }}
+          MODEL_TRIAGE: ${{ env.MODEL_TRIAGE }}
+          DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_sentinel_triage
 
       - name: Coordinator agent (recommendations + insights)
@@ -87,11 +111,12 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          LLM_BASE_URL: "https://api.groq.com/openai/v1"
-          MODEL_ANALYZE: "llama-3.3-70b-versatile"
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
 
-          AGENT_NAME: "coordinator"
-          RAG_TOP_K: "6"
-          MAX_RECOMMENDATIONS: "8"
+          AGENT_NAME: ${{ env.AGENT_NAME_COORD }}
+          MODEL_ANALYZE: ${{ env.MODEL_ANALYZE }}
+          RAG_TOP_K: ${{ env.RAG_TOP_K }}
+          MAX_RECOMMENDATIONS: ${{ env.MAX_RECOMMENDATIONS }}
+          DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_coordinator

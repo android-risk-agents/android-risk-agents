@@ -1,5 +1,7 @@
 # src/agent_coordinator.py
 import os
+import json
+import re
 from typing import Any, Dict, List, Optional
 
 from .db import (
@@ -16,15 +18,25 @@ from .db import (
     vector_search,
 )
 from .embedder import embed_texts
-from .llm_client import get_llm_client, chat_json
+from .llm_client import get_llm_client, chat_json  # ✅ CHANGED
 
 
 SYSTEM_ANALYZE = (
     "You are the Coordinator AI agent for a digital fraud risk intelligence system. "
-    "You prioritize platform ecosystem updates and translate them into concrete opportunities for digital risk solutions. "
+    "You prioritize platform ecosystem updates and translate them into concrete actions for risk monitoring and risk models. "
     "Do not invent facts. If something is unknown, say unknown. "
     "Return ONLY valid JSON, no markdown."
 )
+
+SYSTEM_ANALYZE_STRICT = (
+    SYSTEM_ANALYZE
+    + " CRITICAL: Output exactly ONE JSON object. No code fences. No extra text. "
+      "Make JSON safe to parse: do not include raw control characters. "
+      "If you need new lines inside strings, escape them as \\n."
+)
+
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def _as_int(x: Any, default: int = 0) -> int:
@@ -70,13 +82,82 @@ def _tags(ev: Dict[str, Any], max_items: int = 10) -> List[str]:
     return out
 
 
+def _strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    if s.startswith("```"):
+        s = _CODE_FENCE_RE.sub("", s).strip()
+    return s
+
+
+def _sanitize_control_chars(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = _CTRL_CHARS_RE.sub("", s)
+    return s
+
+
+def _extract_first_json_value(s: str) -> Any:
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("Empty LLM output")
+
+    if not s.startswith("{") and not s.startswith("["):
+        i1 = s.find("{")
+        i2 = s.find("[")
+        candidates = [i for i in (i1, i2) if i != -1]
+        if not candidates:
+            raise ValueError("No JSON start bracket found")
+        s = s[min(candidates):]
+
+    decoder = json.JSONDecoder()
+    obj, _idx = decoder.raw_decode(s)
+    return obj
+
+
+def _safe_parse_json(content: str) -> Dict[str, Any]:
+    content = _strip_code_fences(content)
+    content = _sanitize_control_chars(content)
+
+    obj = _extract_first_json_value(content)
+
+    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        obj = obj[0]
+
+    if not isinstance(obj, dict):
+        raise ValueError(f"Parsed JSON is not an object (got {type(obj)}).")
+
+    return obj
+
+
+def _chat_json_coordinator(
+    client,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    """
+    ✅ CHANGED: route through shared llm_client.chat_json (NIM).
+    """
+    return chat_json(
+        client=client,
+        model=model,
+        system=system,
+        user=user,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
 def build_deep_insight_prompt(url: str, title: str, summary: str, context: str) -> str:
     schema = {
         "title": "string",
-        "summary": "string (2-5 sentences, concrete and actionable)",
+        "summary": "string (3-6 sentences, concrete and actionable, security/risk-model focused)",
         "category": "string (optional)",
-        "affected_signals": ["string (up to 5)"],
-        "recommended_actions": ["string (specific leverage ideas, up to 5)"],
+        "affected_signals": ["string (up to 6)"],
+        "recommended_actions": [
+            "string (actionable steps for risk monitoring / risk models, up to 8; be specific)"
+        ],
         "risk_score": "integer 1-5",
         "confidence": "number 0-1",
     }
@@ -85,7 +166,9 @@ def build_deep_insight_prompt(url: str, title: str, summary: str, context: str) 
         f"EVENT TITLE: {title}\n"
         f"EVENT SUMMARY: {summary}\n\n"
         f"CONTEXT (RAG snippets):\n{context[:6500]}\n\n"
-        "Return JSON only.\n"
+        "Return JSON only. Do not include markdown.\n"
+        "Make recommendations specific to security notes and risk models: "
+        "signals/telemetry to monitor, rules/features to update, tests to add, and what to validate.\n"
         f"Schema:\n{schema}"
     )
 
@@ -96,7 +179,7 @@ def rag_context_from_text(text: str, top_k: int) -> str:
         return ""
 
     q = t[:1200]
-    q_emb = embed_texts([q])[0]
+    q_emb = embed_texts([q], is_query=True)[0]
 
     resp = vector_search(query_embedding=q_emb, match_count=top_k, filter_source_id=None, filter_kind=None)
     rows = resp.data or []
@@ -130,6 +213,7 @@ def main() -> int:
         "recommendations_written": 0,
         "insights_written": 0,
         "errors": 0,
+        "parse_retries": 0,
     }
 
     try:
@@ -140,7 +224,6 @@ def main() -> int:
 
         stats["events_seen"] = len(events)
 
-        # v1 prioritization: sort by local_risk_score then relevance_score
         events_sorted = sorted(
             events,
             key=lambda e: (_as_int(e.get("local_risk_score", 0)), _as_int(e.get("relevance_score", 0))),
@@ -168,17 +251,29 @@ def main() -> int:
                 context = rag_context_from_text(snap_text, top_k=top_k)
 
                 prompt = build_deep_insight_prompt(url, title, summary, context)
-                out = chat_json(
-                    client=client,
-                    model=model,
-                    system=SYSTEM_ANALYZE,
-                    user=prompt,
-                    temperature=0.2,
-                    max_tokens=520,
-                )
 
-                affected = _as_list_str(out.get("affected_signals"), max_items=5, max_len=120) or []
-                actions = _as_list_str(out.get("recommended_actions"), max_items=5, max_len=180) or []
+                try:
+                    out = _chat_json_coordinator(
+                        client=client,
+                        model=model,
+                        system=SYSTEM_ANALYZE,
+                        user=prompt,
+                        temperature=0.2,
+                        max_tokens=650,
+                    )
+                except Exception:
+                    stats["parse_retries"] += 1
+                    out = _chat_json_coordinator(
+                        client=client,
+                        model=model,
+                        system=SYSTEM_ANALYZE_STRICT,
+                        user=prompt + "\n\nIMPORTANT: Output a single JSON object only.",
+                        temperature=0.0,
+                        max_tokens=650,
+                    )
+
+                affected = _as_list_str(out.get("affected_signals"), max_items=6, max_len=140) or []
+                actions = _as_list_str(out.get("recommended_actions"), max_items=8, max_len=220) or []
                 risk_score = _as_int(out.get("risk_score"), 2)
                 confidence = _as_float(out.get("confidence"), 0.6)
 
@@ -187,11 +282,9 @@ def main() -> int:
                 category = out.get("category")
                 category = str(category).strip()[:120] if category else None
 
-                # final risk for recommendation is 0-100 scale from event
                 final_risk = _as_int(ev.get("local_risk_score"), 50)
                 priority = "P0" if final_risk >= 85 else ("P1" if final_risk >= 70 else "P2")
 
-                # Write Insight (deep, structured)
                 if change_id > 0 and source_id > 0 and snapshot_id > 0:
                     insert_insight(
                         change_id=change_id,
@@ -209,7 +302,6 @@ def main() -> int:
                     stats["insights_written"] += 1
                     mark_change_analyzed(change_id)
 
-                # Write Recommendation (prioritized feed)
                 insert_recommendation(
                     run_id=run_id,
                     title=insight_title,
@@ -221,9 +313,9 @@ def main() -> int:
                     rationale=insight_summary,
                     recommended_actions=actions
                     or [
-                        "Review impact on fraud signals and data availability",
-                        "Update monitoring rules and feature pipeline if needed",
-                        "Add regression checks for affected signals",
+                        "Add/adjust monitoring on impacted signals mentioned in the update",
+                        "Update feature definitions or rules if the update changes data availability or integrity checks",
+                        "Add regression tests and alerting for the impacted signal paths",
                     ],
                     related_tags=tags,
                 )
@@ -253,17 +345,16 @@ def main() -> int:
                     action="coordinator_error",
                     ref_type="agent_event",
                     ref_id=ev_id,
-                    detail={"error": str(e)[:600]},
+                    detail={"error": str(e)[:800]},
                 )
 
-        # Mark processed events so reruns do not duplicate outputs
         mark_agent_events_processed(processed_ids)
 
         finish_agent_run(run_id, status="success", stats=stats)
         return 0
 
     except Exception as e:
-        finish_agent_run(run_id, status="failed", stats={**stats, "fatal": str(e)[:600]})
+        finish_agent_run(run_id, status="failed", stats={**stats, "fatal": str(e)[:800]})
         raise
 
 
