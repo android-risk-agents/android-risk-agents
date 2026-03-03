@@ -1,33 +1,23 @@
-name: Android Risk Agents Pipeline (Agentic)
+name: Android Risk Agents (Agents Only)
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: android-risk-agents-pipeline
+  group: android-risk-agents-agents-only
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20
 
     env:
-      # Vector / embed config (keep these if your code depends on them)
-      EMBEDDING_MODEL: "nomic"
-      VECTOR_DIM: "768"
-      VECTOR_TABLE: "vector_chunks"
-      VECTOR_RPC_MATCH: "match_vector_chunks"
-
-      # Helpful for this issue (prints final URL from your client)
-      DEBUG_LLM: "true"
-
-      # Agent knobs
+      DEBUG_LLM: "true"           # remove after it works
       TRIAGE_THRESHOLD: "0.70"
       RAG_TOP_K: "6"
       MAX_RECOMMENDATIONS: "8"
 
-      # Models
       MODEL_TRIAGE: "gemma-2-9b-it"
       MODEL_ANALYZE: "gemma-2-9b-it"
 
@@ -41,39 +31,14 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-
-      - name: Seed sources
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python -m src.seed_sources
-
-      - name: Discover bulletins
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python -m src.discover_bulletins
-
-      - name: Scrape sources
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python -m src.scrape_sources
-
-      - name: Detect changes
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python -m src.detect_changes
 
       - name: Sentinel triage
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          LLM_BASE_URL: ${{ secrets.NVIDIA_LLM_URL }}   # ✅ only here, from secret
+          LLM_BASE_URL: ${{ secrets.NVIDIA_LLM_URL }}
         run: python -m src.agent_sentinel_triage
 
       - name: Coordinator
@@ -81,5 +46,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          LLM_BASE_URL: ${{ secrets.NVIDIA_LLM_URL }}   # ✅ only here, from secret
+          LLM_BASE_URL: ${{ secrets.NVIDIA_LLM_URL }}
         run: python -m src.agent_coordinator
