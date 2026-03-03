@@ -1,4 +1,3 @@
-# src/llm_client.py
 from __future__ import annotations
 
 import json
@@ -140,9 +139,6 @@ def _extract_json_object_block(s: str) -> str:
     - find first '{'
     - slice from there
     - find last '}' and cut there
-
-    This avoids accidentally accepting array-only outputs like:
-      ["Overview", "Setup", "API reference", ...]
     """
     if not s:
         return s
@@ -155,9 +151,7 @@ def _extract_json_object_block(s: str) -> str:
     s2 = s[i:]
     end = s2.rfind("}")
     if end == -1:
-        # Possibly truncated response; return what we have
-        return s2
-
+        return s2  # possibly truncated
     return s2[: end + 1]
 
 
@@ -165,12 +159,6 @@ def _repair_common_json_syntax(s: str) -> str:
     """
     Repair only very common, low-risk issues LLMs emit.
     These fixes do not invent content, they only remove illegal punctuation patterns.
-
-    Repairs:
-    - trailing commas before } or ]
-    - stray ',:' before next key or before close or at end
-    - missing comma between a value-ending token and the next key quote
-    - special case: '",: }' or '",: ]'
     """
     if not s:
         return s
@@ -221,13 +209,7 @@ def _looks_truncated_or_non_object(candidate: str) -> bool:
 
 def _prepare_candidate_json(text: str) -> str:
     """
-    Normalize candidate JSON string:
-    - extract between markers (tolerant)
-    - strip fences
-    - remove illegal control chars
-    - extract likely json OBJECT block
-    - escape newlines inside strings
-    - repair common syntax issues (two passes, deterministic)
+    Normalize candidate JSON string.
     """
     t = _extract_between_markers(text)
     t = _strip_code_fences(t)
@@ -241,10 +223,6 @@ def _prepare_candidate_json(text: str) -> str:
 
 
 def _safe_json_loads(text: str) -> Tuple[Any, Optional[str]]:
-    """
-    Try json.loads with our normalization steps.
-    Returns (obj, error_string). error_string is None on success.
-    """
     candidate = _prepare_candidate_json(text)
     if not candidate:
         return {}, None
@@ -262,16 +240,9 @@ def _safe_json_loads(text: str) -> Tuple[Any, Optional[str]]:
 
 
 def _extract_first_json_obj(text: str) -> Dict[str, Any]:
-    """
-    Extract and parse the first JSON object from model output.
-    Keeps prior functionality:
-    - handles dict
-    - handles singleton list [ { ... } ]
-    - handles list[dict] by returning first dict
-    """
     obj, err = _safe_json_loads(text)
     if err is not None:
-        raise json.JSONDecodeError(err, doc=text or "", pos=0)  # pos not reliable here
+        raise json.JSONDecodeError(err, doc=text or "", pos=0)
 
     obj = _unwrap_singleton_list(obj)
 
@@ -284,12 +255,11 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
 
 def _extract_content_from_nim_envelope(raw_text: str) -> str:
     """
-    NIM returns an OpenAI-compatible envelope JSON. Parse and extract choices[0].message.content.
-    We apply illegal-control cleanup before json.loads to avoid envelope parse failures.
+    NIM returns an OpenAI-compatible envelope JSON.
+    Extract choices[0].message.content.
     """
     cleaned = _remove_illegal_control_chars(raw_text or "")
     data = json.loads(cleaned)
-
     content = (
         (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
     )
@@ -325,18 +295,18 @@ class NimClient:
     ) -> Dict[str, Any]:
         """
         Calls NIM chat/completions and returns parsed JSON from assistant content.
-
-        Reliability layers:
-        - envelope parse with control-char cleanup
-        - marker extraction tolerant to missing start/end
-        - object-only extraction (forces '{ ... }')
-        - safe normalization, newline escaping, low-risk punctuation repairs
-        - truncation/non-object guard (forces retry)
-        - debug context for failures
-        - retries (forces temperature=0 after first parse failure)
         """
         rid = request_id or "req"
-        url = f"{self.base_url}/chat/completions"
+
+        # ✅ FIX: normalize base_url so both forms work:
+        # - https://integrate.api.nvidia.com
+        # - https://integrate.api.nvidia.com/v1
+        base = (self.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -345,9 +315,7 @@ class NimClient:
 
         payload = {
             "model": model,
-            "messages": [
-                {"role": "user", "content": f"{system}\n\n{user}"},
-            ],
+            "messages": [{"role": "user", "content": f"{system}\n\n{user}"}],
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
@@ -356,7 +324,11 @@ class NimClient:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                if self.debug:
+                    print(f"[NIM] url={url}")
+
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_s)
+
                 if self.debug:
                     print(f"[NIM] status={resp.status_code} attempt={attempt} rid={rid}")
 
@@ -414,8 +386,13 @@ class NimClient:
                 time.sleep(0.8 * attempt)
 
         raise RuntimeError(f"NIM request failed after {self.max_retries} attempts: {last_err}")
+
+
+# ✅ UPDATED: respects LLM_BASE_URL (you will set it from secrets.NVIDIA_LLM_URL in Actions)
 def get_llm_client() -> NimClient:
-    return NimClient()
+    base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    return NimClient(base_url=base_url)
+
 
 def chat_json(
     client: NimClient,
@@ -430,5 +407,5 @@ def chat_json(
         system=system,
         user=user,
         temperature=temperature,
-        max_tokens=max_tokens
+        max_tokens=max_tokens,
     )
