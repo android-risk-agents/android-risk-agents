@@ -12,13 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
-    # ✅ Keep embedding/vector config consistent across ALL steps
-    # If you created parallel 768 objects, change VECTOR_TABLE and VECTOR_RPC_MATCH accordingly.
+    # Keep embedding/vector config consistent across ALL steps
     env:
-      EMBEDDING_MODEL: "nomic"          # baai_small | baai_base | nomic
-      VECTOR_DIM: "768"                # 384 for baai_small, 768 for nomic/baai_base
-      VECTOR_TABLE: "vector_chunks"    # or "vector_chunks_768"
-      VECTOR_RPC_MATCH: "match_vector_chunks"  # or "match_vector_chunks_768"
+      EMBEDDING_MODEL: "nomic"                 # baai_small | baai_base | nomic
+      VECTOR_DIM: "768"                       # 384 for baai_small, 768 for nomic/baai_base
+      VECTOR_TABLE: "vector_chunks"           # or "vector_chunks_768"
+      VECTOR_RPC_MATCH: "match_vector_chunks" # or "match_vector_chunks_768"
 
       USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
 
@@ -35,6 +34,16 @@ jobs:
       RAG_TOP_K: "6"
       MAX_RECOMMENDATIONS: "8"
 
+      # Agent configs (only non-secret knobs belong here)
+      TRIAGE_THRESHOLD: "0.70"
+
+      # ✅ Use full NIM model ids
+      MODEL_TRIAGE: "google/gemma-2-9b-it"
+      MODEL_ANALYZE: "google/gemma-2-9b-it"
+
+      # LLM debug
+      DEBUG_LLM: "true"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +53,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Cache HuggingFace models (speedup)
       - name: Cache HF models
         uses: actions/cache@v4
         with:
@@ -86,14 +94,15 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          # Groq now (OpenAI-compatible), vLLM later
-          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          LLM_BASE_URL: "https://api.groq.com/openai/v1"
-          MODEL_TRIAGE: "llama-3.1-8b-instant"
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+
+          # ✅ single knob: update this secret when switching endpoints (NIM vs vLLM)
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
 
           AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
-          # Your sentinel code uses TRIAGE_THRESHOLD as float 0-1
-          TRIAGE_THRESHOLD: "0.70"
+          TRIAGE_THRESHOLD: ${{ env.TRIAGE_THRESHOLD }}
+          MODEL_TRIAGE: ${{ env.MODEL_TRIAGE }}
+          DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_sentinel_triage
 
       - name: Coordinator agent (recommendations + insights)
@@ -101,11 +110,12 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          LLM_BASE_URL: "https://api.groq.com/openai/v1"
-          MODEL_ANALYZE: "llama-3.3-70b-versatile"
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
 
           AGENT_NAME: ${{ env.AGENT_NAME_COORD }}
+          MODEL_ANALYZE: ${{ env.MODEL_ANALYZE }}
           RAG_TOP_K: ${{ env.RAG_TOP_K }}
           MAX_RECOMMENDATIONS: ${{ env.MAX_RECOMMENDATIONS }}
+          DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_coordinator

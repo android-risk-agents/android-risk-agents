@@ -18,7 +18,7 @@ from .db import (
     vector_search,
 )
 from .embedder import embed_texts
-from .llm_client import get_llm_client
+from .llm_client import get_llm_client, chat_json  # ✅ CHANGED
 
 
 SYSTEM_ANALYZE = (
@@ -28,7 +28,6 @@ SYSTEM_ANALYZE = (
     "Return ONLY valid JSON, no markdown."
 )
 
-# Stricter system message used only when we detect parse issues
 SYSTEM_ANALYZE_STRICT = (
     SYSTEM_ANALYZE
     + " CRITICAL: Output exactly ONE JSON object. No code fences. No extra text. "
@@ -36,11 +35,8 @@ SYSTEM_ANALYZE_STRICT = (
       "If you need new lines inside strings, escape them as \\n."
 )
 
-
-# --- helpers ---
-
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
-_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")  # remove illegal JSON control chars
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def _as_int(x: Any, default: int = 0) -> int:
@@ -94,21 +90,16 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _sanitize_control_chars(s: str) -> str:
-    # normalize newlines, then remove illegal control characters
     s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
     s = _CTRL_CHARS_RE.sub("", s)
     return s
 
 
 def _extract_first_json_value(s: str) -> Any:
-    """
-    Extract the first JSON value from a string (object or array) even if extra text exists.
-    """
     s = (s or "").strip()
     if not s:
         raise ValueError("Empty LLM output")
 
-    # If response starts with junk, find first { or [
     if not s.startswith("{") and not s.startswith("["):
         i1 = s.find("{")
         i2 = s.find("[")
@@ -123,13 +114,6 @@ def _extract_first_json_value(s: str) -> Any:
 
 
 def _safe_parse_json(content: str) -> Dict[str, Any]:
-    """
-    Parse coordinator output robustly:
-    - strip code fences
-    - sanitize illegal control chars
-    - raw_decode first JSON value
-    - unwrap [ {..} ] to {..}
-    """
     content = _strip_code_fences(content)
     content = _sanitize_control_chars(content)
 
@@ -153,20 +137,16 @@ def _chat_json_coordinator(
     max_tokens: int,
 ) -> Dict[str, Any]:
     """
-    Coordinator-local chat_json to avoid 'Invalid control character' crashes.
+    ✅ CHANGED: route through shared llm_client.chat_json (NIM).
     """
-    resp = client.chat.completions.create(
+    return chat_json(
+        client=client,
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        system=system,
+        user=user,
         temperature=temperature,
         max_tokens=max_tokens,
     )
-
-    content = resp.choices[0].message.content or ""
-    return _safe_parse_json(content)
 
 
 def build_deep_insight_prompt(url: str, title: str, summary: str, context: str) -> str:
@@ -198,7 +178,6 @@ def rag_context_from_text(text: str, top_k: int) -> str:
     if not t:
         return ""
 
-    # Use is_query=True so Nomic uses search_query prefix
     q = t[:1200]
     q_emb = embed_texts([q], is_query=True)[0]
 
@@ -245,7 +224,6 @@ def main() -> int:
 
         stats["events_seen"] = len(events)
 
-        # v1 prioritization: sort by local_risk_score then relevance_score
         events_sorted = sorted(
             events,
             key=lambda e: (_as_int(e.get("local_risk_score", 0)), _as_int(e.get("relevance_score", 0))),
@@ -274,7 +252,6 @@ def main() -> int:
 
                 prompt = build_deep_insight_prompt(url, title, summary, context)
 
-                # First attempt: normal system
                 try:
                     out = _chat_json_coordinator(
                         client=client,
@@ -284,8 +261,7 @@ def main() -> int:
                         temperature=0.2,
                         max_tokens=650,
                     )
-                except Exception as e:
-                    # Second attempt: stricter system to reduce parse issues
+                except Exception:
                     stats["parse_retries"] += 1
                     out = _chat_json_coordinator(
                         client=client,
@@ -306,11 +282,9 @@ def main() -> int:
                 category = out.get("category")
                 category = str(category).strip()[:120] if category else None
 
-                # final risk for recommendation is 0-100 scale from event
                 final_risk = _as_int(ev.get("local_risk_score"), 50)
                 priority = "P0" if final_risk >= 85 else ("P1" if final_risk >= 70 else "P2")
 
-                # Write Insight (deep, structured)
                 if change_id > 0 and source_id > 0 and snapshot_id > 0:
                     insert_insight(
                         change_id=change_id,
@@ -328,7 +302,6 @@ def main() -> int:
                     stats["insights_written"] += 1
                     mark_change_analyzed(change_id)
 
-                # Write Recommendation (prioritized feed)
                 insert_recommendation(
                     run_id=run_id,
                     title=insight_title,
@@ -375,7 +348,6 @@ def main() -> int:
                     detail={"error": str(e)[:800]},
                 )
 
-        # Mark processed events so reruns do not duplicate outputs
         mark_agent_events_processed(processed_ids)
 
         finish_agent_run(run_id, status="success", stats=stats)
