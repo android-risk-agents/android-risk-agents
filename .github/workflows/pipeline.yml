@@ -46,8 +46,8 @@ jobs:
 
       # Fingerprint enrichment config
       FINGERPRINT_ENABLED: "true"
-      FINGERPRINT_MIN_LOCAL_RISK: "65"
-      FINGERPRINT_MIN_RELEVANCE: "60"
+      FINGERPRINT_MIN_LOCAL_RISK: "50"
+      FINGERPRINT_MIN_RELEVANCE: "50"
       FINGERPRINT_TOP_K: "4"
       FINGERPRINT_VECTOR_RPC: "match_fingerprint_library_chunks"
       FINGERPRINT_TAG_MATCHES: "identifier,device,signal,signals,integrity,permission,permissions,sdk,api,root,emulator,attestation,privacy,telemetry,network,auth"

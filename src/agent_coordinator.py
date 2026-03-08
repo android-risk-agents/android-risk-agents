@@ -189,7 +189,7 @@ def build_deep_insight_prompt(
     }
 
     fp_section = (
-        f"\nFINGERPRINT TECHNICAL EVIDENCE:\n{fingerprint_context[:3500]}\n"
+        f"\nFINGERPRINT TECHNICAL EVIDENCE:\n{fingerprint_context[:5000]}\n"
         if fingerprint_context.strip()
         else "\nFINGERPRINT TECHNICAL EVIDENCE:\nNone available.\n"
     )
@@ -204,13 +204,19 @@ def build_deep_insight_prompt(
         "Make recommendations specific to security notes and risk models: "
         "signals or telemetry to monitor, rules or features to update, tests to add, and what to validate.\n"
         "If Fingerprint technical evidence is available, you MUST ground at least 2 recommended actions "
-        "in the retrieved Fingerprint evidence. Reference specific signal families, identifier providers, "
-        "signal collection logic, fallback behavior, device profiling logic, integrity checks, emulator or "
-        "tamper-related signals, or SDK modules when supported by the evidence.\n"
-        "If evidence mentions AndroidIdProvider, versioned signal sets, kernel version, SDK version, security "
-        "providers, encryption status, or related fingerprint signals, convert that into concrete actions such as "
-        "validation, monitoring, regression testing, fallback review, or feature/rule updates.\n"
-        "Do not overclaim. If evidence is weak, explicitly recommend engineering validation or signal monitoring.\n"
+        "in the retrieved Fingerprint evidence.\n"
+        "When grounding recommendations, prefer concrete references to retrieved modules, files, identifier providers, "
+        "signal collection logic, fallback behavior, device profiling logic, kernel or SDK related signals, "
+        "security providers, emulator or tamper signals, and integrity related checks.\n"
+        "If evidence references AndroidIdProvider, Settings.Secure.getString, versioned signal sets, Android version, "
+        "SDK version, kernel version, encryption status, or security providers, convert that into concrete actions "
+        "such as validation, regression testing, monitoring, fallback review, or feature and rule updates.\n"
+        "At least 2 recommended_actions should explicitly mention a retrieved signal, provider, module, file, or "
+        "fallback behavior when Fingerprint evidence is present.\n"
+        "Do not overclaim. If evidence is weak, explicitly recommend engineering validation or targeted monitoring.\n"
+        "Recommended actions should be operational and specific, not generic. Prefer phrasing like "
+        "'validate identifier fallback behavior', 'monitor null-rate changes in Android ID collection', "
+        "'regression test signal completeness across patch levels', or 'review module-level impact in retrieved files'.\n"
         f"Schema:\n{schema}"
     )
 
@@ -306,18 +312,21 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
 
 def build_fingerprint_query(title: str, summary: str, tags: List[str]) -> str:
     bits: List[str] = []
+
     if title.strip():
-        bits.append(title.strip())
+        bits.append(f"Event title: {title.strip()}")
     if summary.strip():
-        bits.append(summary.strip())
+        bits.append(f"Event summary: {summary.strip()}")
     if tags:
         bits.append("Tags: " + ", ".join(tags[:8]))
 
     bits.append(
-        "Focus on device identifiers, signal collection, fallback logic, "
-        "device profiling, emulator detection, root or tamper signals, "
-        "permissions, integrity checks, telemetry, SDK behavior, and fraud relevance."
+        "Find Fingerprint Android library evidence related to device identifiers, AndroidIdProvider, "
+        "signal collection, versioned signal sets, Android version, SDK version, kernel version, "
+        "security providers, encryption status, fallback behavior, device profiling, integrity checks, "
+        "emulator detection, tamper signals, and fraud-relevant device intelligence."
     )
+
     q = "\n".join(bits).strip()
     return q[:1800]
 
@@ -360,18 +369,26 @@ def fingerprint_context_from_event(title: str, summary: str, tags: List[str], to
 
         file_name = (
             r.get("file_name")
-            or r.get("path")
             or r.get("file_path")
+            or r.get("path")
             or r.get("relative_path")
             or "unknown_file"
         )
-        topic = str(r.get("topic") or r.get("signal_family") or "").strip()
-        summary_text = str(r.get("summary") or r.get("file_summary") or "").strip()
+        file_path = str(r.get("file_path") or "").strip()
+        module_name = str(r.get("module_name") or "").strip()
+        category = str(r.get("category") or "").strip()
+        repo_name = str(r.get("repo_name") or "").strip()
+        summary_text = str(r.get("chunk_summary") or r.get("summary") or "").strip()
+        chunk_title = str(r.get("chunk_title") or "").strip()
         score = r.get("similarity") or r.get("score")
 
         header_parts = [f"[Fingerprint evidence {idx}] file={file_name}"]
-        if topic:
-            header_parts.append(f"topic={topic}")
+        if repo_name:
+            header_parts.append(f"repo={repo_name}")
+        if module_name:
+            header_parts.append(f"module={module_name}")
+        if category:
+            header_parts.append(f"category={category}")
         if score is not None:
             try:
                 header_parts.append(f"score={float(score):.4f}")
@@ -381,15 +398,19 @@ def fingerprint_context_from_event(title: str, summary: str, tags: List[str], to
         section = " | ".join(header_parts)
 
         body_parts: List[str] = []
+        if file_path and file_path != file_name:
+            body_parts.append(f"Path: {file_path[:250]}")
+        if chunk_title:
+            body_parts.append(f"Title: {chunk_title[:200]}")
         if summary_text:
-            body_parts.append(f"Summary: {summary_text[:300]}")
+            body_parts.append(f"Summary: {summary_text[:350]}")
         body_parts.append(f"Chunk: {chunk[:900]}")
 
         out.append(section + "\n" + "\n".join(body_parts))
 
     joined = "\n\n---\n\n".join(out)
     if joined.strip():
-        _debug(f"[FP] context_used_head={joined[:700]}")
+        _debug(f"[FP] context_used_head={joined[:1000]}")
     else:
         _debug("[FP] no fingerprint context returned")
     return joined
@@ -507,7 +528,7 @@ def main() -> int:
                         system=SYSTEM_ANALYZE,
                         user=prompt,
                         temperature=0.2,
-                        max_tokens=800,
+                        max_tokens=900,
                     )
                 except Exception:
                     stats["parse_retries"] += 1
@@ -517,7 +538,7 @@ def main() -> int:
                         system=SYSTEM_ANALYZE_STRICT,
                         user=prompt + "\n\nIMPORTANT: Output a single JSON object only.",
                         temperature=0.0,
-                        max_tokens=800,
+                        max_tokens=900,
                     )
 
                 affected = _as_list_str(out.get("affected_signals"), max_items=6, max_len=140) or []
