@@ -37,12 +37,20 @@ jobs:
       # Agent configs (only non-secret knobs belong here)
       TRIAGE_THRESHOLD: "0.70"
 
-      # ✅ Use full NIM model ids
+      # Use full NIM model ids
       MODEL_TRIAGE: "google/gemma-2-9b-it"
       MODEL_ANALYZE: "google/gemma-2-9b-it"
 
       # LLM debug
       DEBUG_LLM: "true"
+
+      # Fingerprint enrichment config
+      FINGERPRINT_ENABLED: "true"
+      FINGERPRINT_MIN_LOCAL_RISK: "65"
+      FINGERPRINT_MIN_RELEVANCE: "60"
+      FINGERPRINT_TOP_K: "4"
+      FINGERPRINT_VECTOR_RPC: "match_fingerprint_library_chunks"
+      FINGERPRINT_TAG_MATCHES: "identifier,device,signal,signals,integrity,permission,permissions,sdk,api,root,emulator,attestation,privacy,telemetry,network,auth"
 
     steps:
       - name: Checkout
@@ -96,7 +104,7 @@ jobs:
 
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
-          # ✅ single knob: update this secret when switching endpoints (NIM vs vLLM)
+          # single knob: update this secret when switching endpoints (NIM vs vLLM)
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
 
           AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
@@ -118,4 +126,11 @@ jobs:
           RAG_TOP_K: ${{ env.RAG_TOP_K }}
           MAX_RECOMMENDATIONS: ${{ env.MAX_RECOMMENDATIONS }}
           DEBUG_LLM: ${{ env.DEBUG_LLM }}
+
+          FINGERPRINT_ENABLED: ${{ env.FINGERPRINT_ENABLED }}
+          FINGERPRINT_MIN_LOCAL_RISK: ${{ env.FINGERPRINT_MIN_LOCAL_RISK }}
+          FINGERPRINT_MIN_RELEVANCE: ${{ env.FINGERPRINT_MIN_RELEVANCE }}
+          FINGERPRINT_TOP_K: ${{ env.FINGERPRINT_TOP_K }}
+          FINGERPRINT_VECTOR_RPC: ${{ env.FINGERPRINT_VECTOR_RPC }}
+          FINGERPRINT_TAG_MATCHES: ${{ env.FINGERPRINT_TAG_MATCHES }}
         run: python -m src.agent_coordinator

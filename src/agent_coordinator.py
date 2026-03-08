@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from supabase import create_client
+
 from .db import (
     create_agent_run,
     finish_agent_run,
@@ -18,7 +20,7 @@ from .db import (
     vector_search,
 )
 from .embedder import embed_texts
-from .llm_client import get_llm_client, chat_json  # ✅ CHANGED
+from .llm_client import get_llm_client, chat_json
 
 
 SYSTEM_ANALYZE = (
@@ -73,7 +75,7 @@ def _tags(ev: Dict[str, Any], max_items: int = 10) -> List[str]:
         return []
     out: List[str] = []
     for item in t:
-        s = str(item).strip()
+        s = str(item).strip().lower()
         if not s:
             continue
         out.append(s[:60])
@@ -136,9 +138,6 @@ def _chat_json_coordinator(
     temperature: float,
     max_tokens: int,
 ) -> Dict[str, Any]:
-    """
-    ✅ CHANGED: route through shared llm_client.chat_json (NIM).
-    """
     return chat_json(
         client=client,
         model=model,
@@ -149,7 +148,25 @@ def _chat_json_coordinator(
     )
 
 
-def build_deep_insight_prompt(url: str, title: str, summary: str, context: str) -> str:
+def _bool_env(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _csv_env(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default)
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+
+def build_deep_insight_prompt(
+    url: str,
+    title: str,
+    summary: str,
+    context: str,
+    fingerprint_context: str = "",
+) -> str:
     schema = {
         "title": "string",
         "summary": "string (3-6 sentences, concrete and actionable, security/risk-model focused)",
@@ -161,14 +178,26 @@ def build_deep_insight_prompt(url: str, title: str, summary: str, context: str) 
         "risk_score": "integer 1-5",
         "confidence": "number 0-1",
     }
+
+    fp_section = (
+        f"\nFINGERPRINT TECHNICAL EVIDENCE:\n{fingerprint_context[:3500]}\n"
+        if fingerprint_context.strip()
+        else "\nFINGERPRINT TECHNICAL EVIDENCE:\nNone available.\n"
+    )
+
     return (
         f"SOURCE: {url}\n\n"
         f"EVENT TITLE: {title}\n"
         f"EVENT SUMMARY: {summary}\n\n"
-        f"CONTEXT (RAG snippets):\n{context[:6500]}\n\n"
+        f"GENERAL CONTEXT (RAG snippets):\n{context[:6500]}\n"
+        f"{fp_section}\n"
         "Return JSON only. Do not include markdown.\n"
         "Make recommendations specific to security notes and risk models: "
-        "signals/telemetry to monitor, rules/features to update, tests to add, and what to validate.\n"
+        "signals or telemetry to monitor, rules or features to update, tests to add, and what to validate.\n"
+        "If Fingerprint technical evidence is available, use it to make recommendations more concrete. "
+        "For example, reference identifier providers, signal collection logic, fallback behavior, "
+        "device profiling, emulator or tamper signals, integrity-related checks, or related SDK modules.\n"
+        "Do not overclaim. If evidence is weak, recommend validation, monitoring, or engineering review.\n"
         f"Schema:\n{schema}"
     )
 
@@ -181,7 +210,12 @@ def rag_context_from_text(text: str, top_k: int) -> str:
     q = t[:1200]
     q_emb = embed_texts([q], is_query=True)[0]
 
-    resp = vector_search(query_embedding=q_emb, match_count=top_k, filter_source_id=None, filter_kind=None)
+    resp = vector_search(
+        query_embedding=q_emb,
+        match_count=top_k,
+        filter_source_id=None,
+        filter_kind=None,
+    )
     rows = resp.data or []
 
     out: List[str] = []
@@ -193,11 +227,177 @@ def rag_context_from_text(text: str, top_k: int) -> str:
     return "\n\n---\n\n".join(out)
 
 
+def _get_supabase_client():
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing")
+    return create_client(url, key)
+
+
+def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
+    if not _bool_env("FINGERPRINT_ENABLED", True):
+        return False
+
+    min_local_risk = _as_int(os.getenv("FINGERPRINT_MIN_LOCAL_RISK", "65"), 65)
+    min_relevance = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "60"), 60)
+
+    local_risk = _as_int(ev.get("local_risk_score"), 0)
+    relevance = _as_int(ev.get("relevance_score"), 0)
+    tags = _tags(ev)
+    title = str(ev.get("title") or "").lower()
+    summary = str(ev.get("summary") or "").lower()
+
+    if local_risk >= min_local_risk:
+        return True
+    if relevance >= min_relevance:
+        return True
+
+    interesting_tags = set(
+        _csv_env(
+            "FINGERPRINT_TAG_MATCHES",
+            "identifier,device,signal,signals,integrity,permission,permissions,"
+            "sdk,api,root,emulator,attestation,privacy,telemetry,network,auth",
+        )
+    )
+
+    if any(t in interesting_tags for t in tags):
+        return True
+
+    keyword_text = f"{title} {summary}"
+    keyword_matches = [
+        "android id",
+        "device id",
+        "identifier",
+        "signal",
+        "integrity",
+        "permission",
+        "attestation",
+        "sdk",
+        "emulator",
+        "root",
+        "tamper",
+        "fraud",
+        "telemetry",
+        "play integrity",
+        "fingerprinting",
+        "device profile",
+    ]
+    return any(k in keyword_text for k in keyword_matches)
+
+
+def build_fingerprint_query(title: str, summary: str, tags: List[str]) -> str:
+    bits: List[str] = []
+    if title.strip():
+        bits.append(title.strip())
+    if summary.strip():
+        bits.append(summary.strip())
+    if tags:
+        bits.append("Tags: " + ", ".join(tags[:8]))
+
+    bits.append(
+        "Focus on device identifiers, signal collection, fallback logic, "
+        "device profiling, emulator detection, root or tamper signals, "
+        "permissions, integrity checks, telemetry, SDK behavior, and fraud relevance."
+    )
+    q = "\n".join(bits).strip()
+    return q[:1800]
+
+
+def _fingerprint_vector_search(query_embedding: List[float], match_count: int) -> List[Dict[str, Any]]:
+    """
+    Expected RPC shape:
+      rpc_name(query_embedding => vector, match_count => int)
+
+    Default RPC name:
+      match_fingerprint_library_chunks
+
+    This function fails safely and returns [] if the RPC is not available yet.
+    """
+    rpc_name = os.getenv("FINGERPRINT_VECTOR_RPC", "match_fingerprint_library_chunks")
+    client = _get_supabase_client()
+
+    try:
+        resp = client.rpc(
+            rpc_name,
+            {
+                "query_embedding": query_embedding,
+                "match_count": match_count,
+            },
+        ).execute()
+        return resp.data or []
+    except Exception:
+        return []
+
+
+def fingerprint_context_from_event(title: str, summary: str, tags: List[str], top_k: int = 4) -> str:
+    query = build_fingerprint_query(title=title, summary=summary, tags=tags)
+    if not query.strip():
+        return ""
+
+    q_emb = embed_texts([query], is_query=True)[0]
+    rows = _fingerprint_vector_search(query_embedding=q_emb, match_count=top_k)
+
+    out: List[str] = []
+    for idx, r in enumerate(rows[:top_k], start=1):
+        chunk = str(r.get("chunk_text") or "").strip()
+        if not chunk:
+            continue
+
+        file_name = (
+            r.get("file_name")
+            or r.get("path")
+            or r.get("file_path")
+            or r.get("relative_path")
+            or "unknown_file"
+        )
+        topic = str(r.get("topic") or r.get("signal_family") or "").strip()
+        summary_text = str(r.get("summary") or r.get("file_summary") or "").strip()
+        score = r.get("similarity") or r.get("score")
+
+        header_parts = [f"[Fingerprint evidence {idx}] file={file_name}"]
+        if topic:
+            header_parts.append(f"topic={topic}")
+        if score is not None:
+            try:
+                header_parts.append(f"score={float(score):.4f}")
+            except Exception:
+                pass
+
+        section = " | ".join(header_parts)
+
+        body_parts: List[str] = []
+        if summary_text:
+            body_parts.append(f"Summary: {summary_text[:300]}")
+        body_parts.append(f"Chunk: {chunk[:900]}")
+
+        out.append(section + "\n" + "\n".join(body_parts))
+
+    return "\n\n---\n\n".join(out)
+
+
+def _default_actions(final_risk: int, has_fingerprint: bool) -> List[str]:
+    base = [
+        "Add or adjust monitoring on impacted signals mentioned in the update",
+        "Update feature definitions or rules if the update changes data availability or integrity checks",
+        "Add regression tests and alerting for the impacted signal paths",
+    ]
+    if has_fingerprint:
+        base.insert(
+            0,
+            "Review the Fingerprint-related modules surfaced in retrieval and validate whether identifier, device profiling, or fallback logic is affected",
+        )
+    if final_risk >= 85:
+        base.append("Escalate to engineering and fraud analytics for priority validation before the next production cycle")
+    return base[:8]
+
+
 def main() -> int:
     agent_name = os.getenv("AGENT_NAME", "coordinator")
     model = os.getenv("MODEL_ANALYZE", os.getenv("GROQ_MODEL_ANALYZE", "llama-3.3-70b-versatile"))
     top_k = int(os.getenv("RAG_TOP_K", "6"))
     max_recs = int(os.getenv("MAX_RECOMMENDATIONS", "8"))
+    fingerprint_top_k = int(os.getenv("FINGERPRINT_TOP_K", "4"))
 
     client = get_llm_client()
 
@@ -214,6 +414,8 @@ def main() -> int:
         "insights_written": 0,
         "errors": 0,
         "parse_retries": 0,
+        "fingerprint_attempted": 0,
+        "fingerprint_used": 0,
     }
 
     try:
@@ -250,7 +452,26 @@ def main() -> int:
                 snap_text = get_snapshot_text_by_id(snapshot_id) if snapshot_id else ""
                 context = rag_context_from_text(snap_text, top_k=top_k)
 
-                prompt = build_deep_insight_prompt(url, title, summary, context)
+                fingerprint_context = ""
+                use_fp = should_use_fingerprint(ev)
+                if use_fp:
+                    stats["fingerprint_attempted"] += 1
+                    fingerprint_context = fingerprint_context_from_event(
+                        title=title,
+                        summary=summary,
+                        tags=tags,
+                        top_k=fingerprint_top_k,
+                    )
+                    if fingerprint_context.strip():
+                        stats["fingerprint_used"] += 1
+
+                prompt = build_deep_insight_prompt(
+                    url=url,
+                    title=title,
+                    summary=summary,
+                    context=context,
+                    fingerprint_context=fingerprint_context,
+                )
 
                 try:
                     out = _chat_json_coordinator(
@@ -259,7 +480,7 @@ def main() -> int:
                         system=SYSTEM_ANALYZE,
                         user=prompt,
                         temperature=0.2,
-                        max_tokens=650,
+                        max_tokens=800,
                     )
                 except Exception:
                     stats["parse_retries"] += 1
@@ -269,7 +490,7 @@ def main() -> int:
                         system=SYSTEM_ANALYZE_STRICT,
                         user=prompt + "\n\nIMPORTANT: Output a single JSON object only.",
                         temperature=0.0,
-                        max_tokens=650,
+                        max_tokens=800,
                     )
 
                 affected = _as_list_str(out.get("affected_signals"), max_items=6, max_len=140) or []
@@ -285,6 +506,11 @@ def main() -> int:
                 final_risk = _as_int(ev.get("local_risk_score"), 50)
                 priority = "P0" if final_risk >= 85 else ("P1" if final_risk >= 70 else "P2")
 
+                final_actions = actions or _default_actions(
+                    final_risk=final_risk,
+                    has_fingerprint=bool(fingerprint_context.strip()),
+                )
+
                 if change_id > 0 and source_id > 0 and snapshot_id > 0:
                     insert_insight(
                         change_id=change_id,
@@ -296,7 +522,7 @@ def main() -> int:
                         confidence=confidence,
                         category=category,
                         affected_signals=affected,
-                        recommended_actions=actions,
+                        recommended_actions=final_actions,
                         risk_score=risk_score,
                     )
                     stats["insights_written"] += 1
@@ -311,12 +537,7 @@ def main() -> int:
                     event_ids=[ev_id],
                     change_ids=[change_id] if change_id > 0 else [],
                     rationale=insight_summary,
-                    recommended_actions=actions
-                    or [
-                        "Add/adjust monitoring on impacted signals mentioned in the update",
-                        "Update feature definitions or rules if the update changes data availability or integrity checks",
-                        "Add regression tests and alerting for the impacted signal paths",
-                    ],
+                    recommended_actions=final_actions,
                     related_tags=tags,
                 )
 
@@ -334,6 +555,7 @@ def main() -> int:
                         "snapshot_id": snapshot_id,
                         "priority": priority,
                         "final_risk_score": final_risk,
+                        "fingerprint_used": bool(fingerprint_context.strip()),
                     },
                 )
 
