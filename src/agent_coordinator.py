@@ -203,10 +203,14 @@ def build_deep_insight_prompt(
         "Return JSON only. Do not include markdown.\n"
         "Make recommendations specific to security notes and risk models: "
         "signals or telemetry to monitor, rules or features to update, tests to add, and what to validate.\n"
-        "If Fingerprint technical evidence is available, use it to make recommendations more concrete. "
-        "For example, reference identifier providers, signal collection logic, fallback behavior, "
-        "device profiling, emulator or tamper signals, integrity-related checks, or related SDK modules.\n"
-        "Do not overclaim. If evidence is weak, recommend validation, monitoring, or engineering review.\n"
+        "If Fingerprint technical evidence is available, you MUST ground at least 2 recommended actions "
+        "in the retrieved Fingerprint evidence. Reference specific signal families, identifier providers, "
+        "signal collection logic, fallback behavior, device profiling logic, integrity checks, emulator or "
+        "tamper-related signals, or SDK modules when supported by the evidence.\n"
+        "If evidence mentions AndroidIdProvider, versioned signal sets, kernel version, SDK version, security "
+        "providers, encryption status, or related fingerprint signals, convert that into concrete actions such as "
+        "validation, monitoring, regression testing, fallback review, or feature/rule updates.\n"
+        "Do not overclaim. If evidence is weak, explicitly recommend engineering validation or signal monitoring.\n"
         f"Schema:\n{schema}"
     )
 
