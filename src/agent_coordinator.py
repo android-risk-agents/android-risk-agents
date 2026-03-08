@@ -41,6 +41,15 @@ _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
+def _debug_enabled() -> bool:
+    return os.getenv("DEBUG_LLM", "false").strip().lower() == "true"
+
+
+def _debug(msg: str) -> None:
+    if _debug_enabled():
+        print(msg)
+
+
 def _as_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
@@ -239,8 +248,8 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
     if not _bool_env("FINGERPRINT_ENABLED", True):
         return False
 
-    min_local_risk = _as_int(os.getenv("FINGERPRINT_MIN_LOCAL_RISK", "65"), 65)
-    min_relevance = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "60"), 60)
+    min_local_risk = _as_int(os.getenv("FINGERPRINT_MIN_LOCAL_RISK", "40"), 40)
+    min_relevance = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "40"), 40)
 
     local_risk = _as_int(ev.get("local_risk_score"), 0)
     relevance = _as_int(ev.get("relevance_score"), 0)
@@ -257,7 +266,8 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
         _csv_env(
             "FINGERPRINT_TAG_MATCHES",
             "identifier,device,signal,signals,integrity,permission,permissions,"
-            "sdk,api,root,emulator,attestation,privacy,telemetry,network,auth",
+            "sdk,api,root,emulator,attestation,privacy,telemetry,network,auth,"
+            "security,policy,bulletin,vulnerability,patch",
         )
     )
 
@@ -282,6 +292,10 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
         "play integrity",
         "fingerprinting",
         "device profile",
+        "security bulletin",
+        "vulnerability",
+        "policy",
+        "patch",
     ]
     return any(k in keyword_text for k in keyword_matches)
 
@@ -305,15 +319,6 @@ def build_fingerprint_query(title: str, summary: str, tags: List[str]) -> str:
 
 
 def _fingerprint_vector_search(query_embedding: List[float], match_count: int) -> List[Dict[str, Any]]:
-    """
-    Expected RPC shape:
-      rpc_name(query_embedding => vector, match_count => int)
-
-    Default RPC name:
-      match_fingerprint_library_chunks
-
-    This function fails safely and returns [] if the RPC is not available yet.
-    """
     rpc_name = os.getenv("FINGERPRINT_VECTOR_RPC", "match_fingerprint_library_chunks")
     client = _get_supabase_client()
 
@@ -325,8 +330,11 @@ def _fingerprint_vector_search(query_embedding: List[float], match_count: int) -
                 "match_count": match_count,
             },
         ).execute()
-        return resp.data or []
-    except Exception:
+        rows = resp.data or []
+        _debug(f"[FP] rpc={rpc_name} rows_returned={len(rows)}")
+        return rows
+    except Exception as e:
+        _debug(f"[FP] rpc={rpc_name} error={str(e)[:500]}")
         return []
 
 
@@ -334,6 +342,8 @@ def fingerprint_context_from_event(title: str, summary: str, tags: List[str], to
     query = build_fingerprint_query(title=title, summary=summary, tags=tags)
     if not query.strip():
         return ""
+
+    _debug(f"[FP] query_head={query[:300]}")
 
     q_emb = embed_texts([query], is_query=True)[0]
     rows = _fingerprint_vector_search(query_embedding=q_emb, match_count=top_k)
@@ -373,7 +383,12 @@ def fingerprint_context_from_event(title: str, summary: str, tags: List[str], to
 
         out.append(section + "\n" + "\n".join(body_parts))
 
-    return "\n\n---\n\n".join(out)
+    joined = "\n\n---\n\n".join(out)
+    if joined.strip():
+        _debug(f"[FP] context_used_head={joined[:700]}")
+    else:
+        _debug("[FP] no fingerprint context returned")
+    return joined
 
 
 def _default_actions(final_risk: int, has_fingerprint: bool) -> List[str]:
@@ -425,6 +440,7 @@ def main() -> int:
             return 0
 
         stats["events_seen"] = len(events)
+        _debug(f"[COORD] pending_events={len(events)}")
 
         events_sorted = sorted(
             events,
@@ -454,6 +470,13 @@ def main() -> int:
 
                 fingerprint_context = ""
                 use_fp = should_use_fingerprint(ev)
+
+                _debug(
+                    f"[FP] event_id={ev_id} use_fp={use_fp} "
+                    f"local_risk={ev.get('local_risk_score')} "
+                    f"relevance={ev.get('relevance_score')} tags={tags}"
+                )
+
                 if use_fp:
                     stats["fingerprint_attempted"] += 1
                     fingerprint_context = fingerprint_context_from_event(
@@ -572,6 +595,7 @@ def main() -> int:
 
         mark_agent_events_processed(processed_ids)
 
+        _debug(f"[COORD] stats={json.dumps(stats)}")
         finish_agent_run(run_id, status="success", stats=stats)
         return 0
 
