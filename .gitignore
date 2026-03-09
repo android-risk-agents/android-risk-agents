@@ -29,3 +29,5 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 src/gcp-credentials.json
+venv/
+.env

@@ -9,17 +9,16 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .db import get_supabase_client, get_latest_snapshot_for_source, upsert_vector_chunks
 from .config import USER_AGENT, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, EMBED_BASELINE_ON_FIRST_SNAPSHOT
-from .embedder import chunk_text, embed_texts
+from .embedder import embed_texts  # Removed chunk_text, keeping our semantic chunker
 
 HEADERS = {"User-Agent": USER_AGENT}
 
 # ── Quality thresholds ─────────────────────────────────────────────────────────
-MIN_CLEAN_TEXT_LEN  = 1200
-MAX_CLEAN_TEXT_CHARS = 25_000
-REQUEST_TIMEOUT_S   = 30
+MIN_CLEAN_TEXT_LEN   = 1200  # Lowered back to 1200 so we don't skip short security bulletins!
+MAX_CLEAN_TEXT_CHARS = 25_000 
+REQUEST_TIMEOUT_S    = 30
 
-# Tags whose *content* is pure navigation / chrome — decompose entirely
-# UPDATED: Added Google DevSite specific web components
+# Tags whose *content* is pure navigation / chrome
 _JUNK_TAGS = [
     "script", "style", "noscript", "svg", "canvas", "iframe",
     "button", "form", "input", "select", "textarea",
@@ -30,13 +29,12 @@ _JUNK_TAGS = [
 ]
 
 # Role / class / id fragments that signal non-content containers
-# UPDATED: Added CISA (usa-banner) and Android Blog (widget, archive) targets
 _JUNK_ATTRS = re.compile(
     r"(breadcrumb|cookie|consent|banner|promo|sidebar|toc-nav|"
     r"pagination|share|social|print|feedback|rating|related|"
     r"newsletter|subscribe|popup|modal|overlay|ads?|sponsor|"
     r"announcement|alert-bar|skip-link|widget|archive|devsite-page-nav|"
-    r"usa-banner|usa-nav|usa-footer)",
+    r"usa-banner|usa-nav|usa-footer|language|lang)",
     re.IGNORECASE,
 )
 
@@ -57,6 +55,8 @@ _LEGAL_PATTERNS = [
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+_JSON_BLOB_RE = re.compile(r"^\s*[\{\[](.|\n){80,}[\}\]]\s*$")
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -64,7 +64,6 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 def _is_junk_element(tag: Tag) -> bool:
-    """Return True if a tag looks like navigation/chrome rather than content."""
     for attr in ("class", "id", "role", "aria-label"):
         val = tag.get(attr, "")
         if isinstance(val, list):
@@ -74,26 +73,22 @@ def _is_junk_element(tag: Tag) -> bool:
     return False
 
 def _remove_junk_tags(root: Tag) -> None:
-    """Decompose tags that are definitively non-content."""
     for tag in root.find_all(_JUNK_TAGS):
         tag.decompose()
 
 def _remove_junk_containers(root: Tag) -> None:
-    """Decompose divs/sections whose class/id signal chrome."""
     for tag in root.find_all(True):
         if tag.name in ("div", "section", "span", "ul", "ol", "li") and _is_junk_element(tag):
             tag.decompose()
 
 def _pick_root(soup: BeautifulSoup) -> Tag:
-    """
-    Prefer the most specific semantic content container.
-    UPDATED: Prioritizes Google DevSite and Android Blog architectures.
-    """
     candidates = [
-        soup.find("devsite-content"),             # Priority 1: Google/Android Docs
-        soup.find("div", {"class": "post-body"}), # Priority 2: Android Blog content
+        soup.find("div", {"class": re.compile(r"devsite-article-body", re.I)}),  
+        soup.find("main", {"class": re.compile(r"devsite-main-content", re.I)}), 
+        soup.find("devsite-content"),             
+        soup.find("div", {"class": "post-body"}), 
         soup.find("article"),
-        soup.find("main"),                        # Priority 3: CISA KEV Catalog
+        soup.find("main"),                        
         soup.find("div", {"id": re.compile(r"(content|main|article|body)", re.I)}),
         soup.find("div", {"class": re.compile(r"(devsite-article|article-body|page-content|"
                                                r"document-content|entry-content|post-content)", re.I)}),
@@ -104,10 +99,6 @@ def _pick_root(soup: BeautifulSoup) -> Tag:
     return next((c for c in candidates if c is not None), soup)
 
 def _table_to_text(table: Tag) -> str:
-    """
-    Convert an HTML table to pipe-delimited text rows so 768-dim models 
-    can embed structured data (CVE tables, KEV catalog entries) properly.
-    """
     rows = []
     for tr in table.find_all("tr"):
         cells = [td.get_text(separator=" ", strip=True) for td in tr.find_all(["th", "td"])]
@@ -116,10 +107,6 @@ def _table_to_text(table: Tag) -> str:
     return "\n".join(rows)
 
 def _semantic_cleaner(root: Tag) -> str:
-    """
-    Walk the cleaned DOM and emit semantically structured plain text.
-    Handles: headings → [SECTION:], tables → pipe rows, lists → bullets.
-    """
     parts: List[str] = []
 
     def _walk(node):
@@ -176,17 +163,20 @@ def _semantic_cleaner(root: Tag) -> str:
 
     return text.strip()
 
+def _remove_json_blobs(text: str) -> str:
+    out = []
+    for line in text.splitlines():
+        if _JSON_BLOB_RE.match(line):
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
 def _remove_legal_noise(text: str) -> str:
-    """Strip boilerplate / legal footer text that dilutes embeddings."""
     for pattern in _LEGAL_PATTERNS:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     return text.strip()
 
 def _deduplicate_lines(text: str) -> str:
-    """
-    Remove duplicate or near-duplicate lines (common from repeated nav
-    items that survive tag removal).
-    """
     seen: set = set()
     output: List[str] = []
     for line in text.splitlines():
@@ -198,6 +188,19 @@ def _deduplicate_lines(text: str) -> str:
             seen.add(key)
             output.append(line)
     return "\n".join(output)
+
+_LANG_NOISE_RE = re.compile(
+    r"(English\s*/\s*日本語\s*/\s*한국어\s*/\s*русск(ий|ий)\s*/\s*简体中文\s*/\s*繁體中文)",
+    re.IGNORECASE,
+)
+
+def _remove_language_selector_lines(text: str) -> str:
+    out: List[str] = []
+    for line in text.splitlines():
+        if _LANG_NOISE_RE.search(line):
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
 
 def _cap_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -226,13 +229,53 @@ def fetch_raw_and_clean(url: str) -> Tuple[str, str]:
     clean_text = _semantic_cleaner(root)
     clean_text = _remove_legal_noise(clean_text)
     clean_text = _deduplicate_lines(clean_text)
+    clean_text = _remove_language_selector_lines(clean_text)
     
-    # Strip out empty sections created by nav removal
     clean_text = re.sub(r"\[SECTION: \]\n+", "", clean_text)
     clean_text = re.sub(r"\n{3,}", "\n\n", clean_text).strip()
     clean_text = _cap_text(clean_text, MAX_CLEAN_TEXT_CHARS)
-
+    clean_text = _remove_json_blobs(clean_text) 
     return raw_html, clean_text
+
+# ── Semantic Chunking ──────────────────────────────────────────────────────────
+
+def semantic_chunk_text(text: str, max_chars: int = 1600, overlap_chars: int = 200) -> List[str]:
+    paragraphs = re.split(r'\n{2,}', text)
+    chunks = []
+    current_chunk = ""
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        if len(para) > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            for i in range(0, len(para), max_chars - overlap_chars):
+                chunks.append(para[i:i + max_chars].strip())
+            continue
+
+        if len(current_chunk) + len(para) + 2 > max_chars:
+            chunks.append(current_chunk.strip())
+            
+            overlap_text = current_chunk[-overlap_chars:] if len(current_chunk) > overlap_chars else current_chunk
+            space_idx = overlap_text.find(" ")
+            if space_idx != -1:
+                overlap_text = overlap_text[space_idx:].strip()
+            
+            current_chunk = overlap_text + "\n\n" + para
+        else:
+            if current_chunk:
+                current_chunk += "\n\n" + para
+            else:
+                current_chunk = para
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
 
 # ── Vector storage ─────────────────────────────────────────────────────────────
 
@@ -243,11 +286,13 @@ def _store_vectors_for_snapshot(
     kind: str,
     clean_text: str,
 ) -> int:
-    chunks = chunk_text(
+    
+    chunks = semantic_chunk_text(
         clean_text,
-        chunk_size_chars=CHUNK_SIZE_CHARS,
+        max_chars=CHUNK_SIZE_CHARS,
         overlap_chars=CHUNK_OVERLAP_CHARS,
     )
+    
     if not chunks:
         return 0
 

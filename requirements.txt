@@ -1,6 +1,6 @@
 # --- Core Environment ---
 python-dotenv==1.0.1
-urllib3<2  # Downgraded to v1.x to fix macOS LibreSSL compatibility
+urllib3<2  
 
 # --- Web Scraping & Text Extraction ---
 requests==2.31.0
@@ -9,10 +9,11 @@ lxml==5.1.0
 
 # --- Database & Storage ---
 supabase==2.4.0
-postgrest==0.10.10
+# NOTE: postgrest is removed! Supabase handles this dependency automatically now.
 
 # --- NLP & Embeddings (BAAI / Nomic) ---
 sentence-transformers==2.5.1
+transformers>=4.39.0      # ADDED: Required for Nomic v1.5's custom architecture
 torch==2.2.1
 numpy==1.26.4
 scikit-learn==1.4.1.post1
@@ -20,6 +21,9 @@ einops==0.7.0
 
 # --- Google Cloud / Vertex AI ---
 google-cloud-aiplatform==1.80.0
+
+# --- Capstone UI & Agent ---
+streamlit>=1.32.0         # ADDED: For the final dashboard deployment
 
 # --- Utilities ---
 typing-extensions==4.10.0
