@@ -7,11 +7,9 @@ AGENT_NAME = "android-risk-agent"
 # --- STATIC SOURCES ---
 # Note: The first entry name precisely matches what discover_bulletins.py queries for.
 SOURCES = [
-    {"name": "Android Security Bulletins", "url": "https://source.android.com/docs/security/bulletin", "fetch_type": "html"},
     {"name": "Android Developers Blog", "url": "https://android-developers.googleblog.com/", "fetch_type": "html"},
     {"name": "Google Play Developer Policy Center", "url": "https://play.google/developer-content-policy/", "fetch_type": "html"},
     {"name": "Play Integrity API Docs", "url": "https://developer.android.com/google/play/integrity", "fetch_type": "html"},
-    {"name": "CISA KEV Catalog", "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", "fetch_type": "html"}
 ]
 
 def main():
