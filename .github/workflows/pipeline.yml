@@ -26,13 +26,13 @@ jobs:
 
       # First-run demo behavior
       INIT_BASELINE_AS_CHANGE: "true"
-      BASELINE_MAX_SOURCES: "10"
+      BASELINE_MAX_SOURCES: "25"
 
       AGENT_NAME_TRIAGE: "sentinel-triage"
       AGENT_NAME_COORD: "coordinator"
 
       RAG_TOP_K: "6"
-      MAX_RECOMMENDATIONS: "8"
+      MAX_RECOMMENDATIONS: "20"
 
       # Agent configs (only non-secret knobs belong here)
       TRIAGE_THRESHOLD: "0.70"
