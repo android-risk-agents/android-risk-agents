@@ -1,7 +1,11 @@
 import hashlib
+import io
 import json
+import os
 import re
-from datetime import datetime, timezone
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
 from typing import Tuple, Dict, Any, List
 
 import requests
@@ -329,6 +333,313 @@ def fetch_json_and_clean(url: str) -> Tuple[str, str]:
     return raw_json_str, clean_text
 
 
+# ── RSS / Atom fetch + clean (Android Developers Blog) ────────────────────────
+
+
+def fetch_rss_and_clean(url: str) -> Tuple[str, str]:
+    """
+    Fetch an RSS or Atom feed and return (raw_xml_str, clean_text).
+
+    Parses standard RSS 2.0 and Atom 1.0 without external libraries.
+    Each entry is rendered as a structured block: title, date, summary/content.
+    Used for the Android Developers Blog Atom feed which is static XML and
+    contains full post content including security and policy announcements.
+    """
+    resp = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=REQUEST_TIMEOUT_S,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    raw_xml = resp.text or ""
+
+    soup = BeautifulSoup(raw_xml, "xml")
+
+    entries = soup.find_all("entry") or soup.find_all("item")
+    if not entries:
+        raise ValueError(f"RSS/Atom feed at {url} contained no entries.")
+
+    blocks: List[str] = [f"[SECTION: ANDROID DEVELOPERS BLOG FEED]\nTotal entries: {len(entries)}\n"]
+
+    for entry in entries:
+        # Title
+        title_tag = entry.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else "Untitled"
+
+        # Date - try multiple field names
+        date = ""
+        for tag in ("published", "updated", "pubDate", "dc:date"):
+            t = entry.find(tag)
+            if t:
+                date = t.get_text(strip=True)
+                break
+
+        # Content - prefer full content over summary
+        content = ""
+        for tag in ("content", "content:encoded", "summary", "description"):
+            t = entry.find(tag)
+            if t:
+                raw = t.get_text(separator=" ", strip=True)
+                if len(raw) > len(content):
+                    content = raw
+
+        # Link
+        link_tag = entry.find("link")
+        link = ""
+        if link_tag:
+            link = link_tag.get("href") or link_tag.get_text(strip=True)
+
+        block = (
+            f"[ENTRY] {title}\n"
+            f"Date: {date}\n"
+            f"URL: {link}\n"
+            f"Content: {content[:2000]}\n"
+            f"---"
+        )
+        blocks.append(block)
+
+    clean_text = "\n".join(blocks)
+    clean_text = _cap_text(clean_text, MAX_CLEAN_TEXT_CHARS)
+    return raw_xml, clean_text
+
+
+# ── NVD CVE API 2.0 fetch + clean ─────────────────────────────────────────────
+
+# How many days back to query on each pipeline run.
+# 30 days catches any recently added/modified Android CVEs including
+# retroactive NVD enrichment of older CVE IDs.
+NVD_LOOKBACK_DAYS = int(os.getenv("NVD_LOOKBACK_DAYS", "30"))
+NVD_RESULTS_PER_PAGE = 100
+# Polite delay between paginated NVD requests (keyless = 5 req / 30s)
+NVD_REQUEST_DELAY_S = 7.0
+
+
+def _format_nvd_cve(cve: Dict[str, Any]) -> str:
+    """Render a single NVD CVE 2.0 record as structured plain text."""
+    cve_id = cve.get("id", "N/A")
+    status = cve.get("vulnStatus", "")
+    published = cve.get("published", "")
+    last_modified = cve.get("lastModified", "")
+
+    # English description
+    desc = ""
+    for d in (cve.get("descriptions") or []):
+        if d.get("lang") == "en":
+            desc = d.get("value", "")
+            break
+
+    # CVSS scores - prefer v3.1, fall back to v3.0, then v2
+    severity = ""
+    base_score = ""
+    vector = ""
+    metrics = cve.get("metrics", {})
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        entries = metrics.get(key)
+        if entries:
+            m = entries[0].get("cvssData", {})
+            severity = entries[0].get("baseSeverity", m.get("baseSeverity", ""))
+            base_score = str(m.get("baseScore", ""))
+            vector = m.get("vectorString", "")
+            break
+
+    # CWE
+    weaknesses = cve.get("weaknesses") or []
+    cwes = []
+    for w in weaknesses:
+        for desc_item in (w.get("description") or []):
+            if desc_item.get("lang") == "en":
+                cwes.append(desc_item.get("value", ""))
+    cwe_str = ", ".join(cwes[:3])
+
+    # CISA KEV flag
+    cisa = cve.get("cisaExploitAdd", "")
+    cisa_action = cve.get("cisaRequiredAction", "")
+
+    lines = [
+        f"[CVE] {cve_id}",
+        f"Status: {status}",
+        f"Published: {published}  |  Last Modified: {last_modified}",
+        f"Severity: {severity}  |  CVSS Score: {base_score}  |  Vector: {vector}",
+        f"CWE: {cwe_str}",
+        f"Description: {desc[:800]}",
+    ]
+    if cisa:
+        lines.append(f"CISA KEV Date Added: {cisa}  |  Action: {cisa_action}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def fetch_nvd_and_clean(url: str) -> Tuple[str, str]:
+    """
+    Query the NVD CVE 2.0 API for Android-related CVEs modified in the last
+    NVD_LOOKBACK_DAYS days. Handles pagination automatically.
+
+    The `url` parameter is used as the base URL (so seed_sources controls the
+    keyword) and date range params are appended dynamically each run.
+
+    Returns (raw_json_str, clean_text).
+    The raw_json_str is the concatenated raw responses (newline-separated JSON).
+    """
+    now_utc = datetime.now(timezone.utc)
+    start = now_utc - timedelta(days=NVD_LOOKBACK_DAYS)
+
+    # ISO-8601 format NVD expects: 2026-01-01T00:00:00.000
+    fmt = "%Y-%m-%dT%H:%M:%S.000"
+    start_str = start.strftime(fmt)
+    end_str = now_utc.strftime(fmt)
+
+    all_cves: List[Dict[str, Any]] = []
+    raw_parts: List[str] = []
+    start_index = 0
+    total_results = None
+
+    while True:
+        params = {
+            "keywordSearch": "android",
+            "resultsPerPage": NVD_RESULTS_PER_PAGE,
+            "startIndex": start_index,
+            "lastModStartDate": start_str,
+            "lastModEndDate": end_str,
+        }
+
+        resp = requests.get(
+            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            headers={**HEADERS, "Accept": "application/json"},
+            params=params,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw_parts.append(resp.text)
+
+        data = resp.json()
+        if total_results is None:
+            total_results = int(data.get("totalResults", 0))
+            print(
+                f"  [NVD] totalResults={total_results} "
+                f"window={start_str} -> {end_str}",
+                flush=True,
+            )
+
+        batch = data.get("vulnerabilities", [])
+        for item in batch:
+            all_cves.append(item.get("cve", {}))
+
+        start_index += len(batch)
+        if start_index >= total_results or not batch:
+            break
+
+        # Polite delay between pages to stay within keyless rate limit
+        time.sleep(NVD_REQUEST_DELAY_S)
+
+    if not all_cves:
+        raise ValueError(
+            f"NVD API returned 0 Android CVEs for window "
+            f"{start_str} -> {end_str}. Check rate limit or window."
+        )
+
+    header = (
+        f"[SECTION: NVD CVE FEED - ANDROID (LAST {NVD_LOOKBACK_DAYS} DAYS)]\n"
+        f"Query window: {start_str} to {end_str}\n"
+        f"Total results: {total_results}  |  Retrieved: {len(all_cves)}\n\n"
+    )
+    body = "\n".join(_format_nvd_cve(c) for c in all_cves)
+    clean_text = _cap_text(header + body, MAX_CLEAN_TEXT_CHARS)
+
+    return "\n".join(raw_parts), clean_text
+
+
+# ── OSV Android bulk ZIP fetch + clean ────────────────────────────────────────
+
+# How many OSV records to include per snapshot. The Android ecosystem zip
+# contains thousands of entries; cap to keep clean_text within storage limits.
+OSV_MAX_RECORDS = int(os.getenv("OSV_MAX_RECORDS", "500"))
+
+
+def _format_osv_entry(entry: Dict[str, Any]) -> str:
+    """Render a single OSV record as structured plain text."""
+    osv_id = entry.get("id", "N/A")
+    aliases = ", ".join(entry.get("aliases") or [])
+    summary = entry.get("summary", "")
+    details = (entry.get("details") or "")[:600]
+    modified = entry.get("modified", "")
+    published = entry.get("published", "")
+    severity = ""
+    for s in (entry.get("severity") or []):
+        severity = f"{s.get('type','')} {s.get('score','')}".strip()
+        break
+
+    lines = [
+        f"[OSV] {osv_id}",
+        f"Aliases: {aliases}",
+        f"Published: {published}  |  Modified: {modified}",
+        f"Severity: {severity}",
+        f"Summary: {summary}",
+        f"Details: {details}",
+        "---",
+    ]
+    return "\n".join(lines)
+
+
+def fetch_osv_and_clean(url: str) -> Tuple[str, str]:
+    """
+    Download the OSV Android ecosystem bulk ZIP from Google's GCS bucket,
+    extract all JSON records, and render as structured plain text.
+
+    Sorted by `modified` descending so the most recent vulnerabilities appear
+    first and survive the MAX_CLEAN_TEXT_CHARS cap.
+
+    Returns (raw_manifest_json, clean_text) where raw_manifest_json is a
+    lightweight JSON summary (not the full zip bytes) for the raw_text column.
+    """
+    resp = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=120,   # zip can be several MB
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    zip_bytes = resp.content
+    entries: List[Dict[str, Any]] = []
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for name in zf.namelist():
+            if not name.endswith(".json"):
+                continue
+            try:
+                with zf.open(name) as f:
+                    entry = json.load(f)
+                    if isinstance(entry, dict):
+                        entries.append(entry)
+            except Exception:
+                continue
+
+    if not entries:
+        raise ValueError("OSV Android zip contained no parseable JSON records.")
+
+    # Sort newest-modified first
+    entries.sort(key=lambda e: e.get("modified", ""), reverse=True)
+    top = entries[:OSV_MAX_RECORDS]
+
+    raw_manifest = json.dumps({
+        "source": url,
+        "total_in_zip": len(entries),
+        "records_rendered": len(top),
+        "newest_modified": entries[0].get("modified", "") if entries else "",
+    })
+
+    header = (
+        f"[SECTION: OSV ANDROID VULNERABILITY DATABASE]\n"
+        f"Total records in zip: {len(entries)}\n"
+        f"Records rendered (newest first): {len(top)}\n\n"
+    )
+    body = "\n".join(_format_osv_entry(e) for e in top)
+    clean_text = _cap_text(header + body, MAX_CLEAN_TEXT_CHARS)
+
+    return raw_manifest, clean_text
+
+
 # ── Vector storage ─────────────────────────────────────────────────────────────
 
 
@@ -400,9 +711,14 @@ def main():
         try:
             if fetch_type == "json":
                 raw_text, clean_text = fetch_json_and_clean(url)
+            elif fetch_type == "rss":
+                raw_text, clean_text = fetch_rss_and_clean(url)
+            elif fetch_type == "api_nvd":
+                raw_text, clean_text = fetch_nvd_and_clean(url)
+            elif fetch_type == "api_osv":
+                raw_text, clean_text = fetch_osv_and_clean(url)
             else:
-                # Default: treat as HTML (covers fetch_type="html" and any
-                # unrecognised values so new types degrade gracefully)
+                # Default: HTML (covers fetch_type="html" and unknown values)
                 raw_text, clean_text = fetch_raw_and_clean(url)
         except Exception as e:
             print(f"⚠️  Fetch failed for source='{name}' (fetch_type={fetch_type}): {e}", flush=True)
