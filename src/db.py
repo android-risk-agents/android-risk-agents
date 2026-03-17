@@ -179,9 +179,8 @@ def get_snapshot_embeddings(snapshot_id: int) -> List[List[float]]:
     """
     Fetch all chunk embeddings stored in vector_chunks for a given snapshot_id.
     Returns a list of embedding vectors (each a list of floats).
-    Used by the sentinel triage agent to build a document-level embedding by
-    averaging chunk embeddings - avoids re-embedding already-stored content.
-    Returns empty list if no chunks found (e.g. snapshot was skipped by embedder).
+    Supabase may return the pgvector embedding column as a JSON string
+    rather than a parsed list - handles both formats.
     """
     sb = get_supabase_client()
     resp = (
@@ -192,7 +191,21 @@ def get_snapshot_embeddings(snapshot_id: int) -> List[List[float]]:
         .execute()
     )
     rows = resp.data or []
-    return [row["embedding"] for row in rows if row.get("embedding")]
+    result: List[List[float]] = []
+    for row in rows:
+        emb = row.get("embedding")
+        if emb is None:
+            continue
+        # Supabase returns pgvector as a string e.g. "[0.1,0.2,...]"
+        if isinstance(emb, str):
+            try:
+                import json as _json
+                emb = _json.loads(emb)
+            except Exception:
+                continue
+        if isinstance(emb, list) and emb:
+            result.append([float(v) for v in emb])
+    return result
 
 
 def upsert_vector_chunks(rows: List[Dict[str, Any]]) -> None:
