@@ -521,26 +521,33 @@ def main() -> int:
                     ev["risk_category"] = classification.get("risk_category", "")
                     ev["risk_bucket"]   = classification.get("risk_bucket", "")
 
-                # Always attempt fingerprint retrieval for every event.
-                # If the fingerprint vector store returns results they are used
-                # for grounding. If nothing is returned the prompt falls back to
-                # grounding recommendations in CVE/patch/policy details from the
-                # event summary and RAG context instead.
-                stats["fingerprint_attempted"] += 1
-                fingerprint_context = fingerprint_context_from_event(
-                    title=title,
-                    summary=summary,
-                    tags=tags,
-                    top_k=fingerprint_top_k,
-                )
-                fp_used = bool(fingerprint_context.strip())
-                if fp_used:
-                    stats["fingerprint_used"] += 1
+                # Fingerprint retrieval: only for categories where device SDK
+                # signals are directly relevant. CISA KEV, NVD CVEs for
+                # non-device components, policy updates, malware exposure,
+                # and general platform updates do not benefit from fingerprint
+                # SDK evidence and produce irrelevant AndroidIdProvider references.
+                FINGERPRINT_CATEGORIES = {"device_integrity", "fraud_signal_degradation"}
+                risk_category = ev.get("risk_category", "")
+                attempt_fp = risk_category in FINGERPRINT_CATEGORIES
+
+                fingerprint_context = ""
+                fp_used = False
+
+                if attempt_fp:
+                    stats["fingerprint_attempted"] += 1
+                    fingerprint_context = fingerprint_context_from_event(
+                        title=title,
+                        summary=summary,
+                        tags=tags,
+                        top_k=fingerprint_top_k,
+                    )
+                    fp_used = bool(fingerprint_context.strip())
+                    if fp_used:
+                        stats["fingerprint_used"] += 1
 
                 _debug(
-                    f"[FP] event_id={ev_id} fp_used={fp_used} "
-                    f"risk_category={ev.get('risk_category')} "
-                    f"local_risk={ev.get('local_risk_score')} tags={tags}"
+                    f"[FP] event_id={ev_id} risk_category={risk_category} "
+                    f"attempt_fp={attempt_fp} fp_used={fp_used} tags={tags}"
                 )
 
                 prompt = build_deep_insight_prompt(
@@ -573,7 +580,6 @@ def main() -> int:
 
                 affected = _as_list_str(out.get("affected_signals"), max_items=6, max_len=140) or []
                 actions = _as_list_str(out.get("recommended_actions"), max_items=8, max_len=220) or []
-                risk_score = _as_int(out.get("risk_score"), 2)
                 confidence = _as_float(out.get("confidence"), 0.6)
 
                 insight_title = str(out.get("title") or title)[:180]
@@ -581,8 +587,24 @@ def main() -> int:
                 category = out.get("category")
                 category = str(category).strip()[:120] if category else None
 
-                final_risk = _as_int(ev.get("local_risk_score"), 50)
-                priority = "P0" if final_risk >= 85 else ("P1" if final_risk >= 70 else "P2")
+                # Derive risk score (1-5) and priority from risk_bucket set by
+                # sentinel classifier rather than the raw local_risk_score int
+                # (which is always 90/60/30 making everything look identical).
+                risk_bucket = ev.get("risk_bucket", "").lower()
+                if risk_bucket == "high":
+                    risk_score = 5
+                    priority   = "P0"
+                elif risk_bucket == "medium":
+                    risk_score = 3
+                    priority   = "P1"
+                else:
+                    # low bucket or unknown
+                    risk_score = 1
+                    priority   = "P2"
+
+                # final_risk kept as 0-100 int for insert_recommendation
+                # which uses it for display, mapped from bucket
+                final_risk = {"high": 85, "medium": 60, "low": 30}.get(risk_bucket, 50)
 
                 final_actions = actions or _default_actions(
                     final_risk=final_risk,
