@@ -29,3 +29,5 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 scripts/
+
+streamlit_app_V1.py
