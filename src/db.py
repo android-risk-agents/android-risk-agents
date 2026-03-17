@@ -300,6 +300,24 @@ def insert_agent_event(payload: Dict[str, Any]) -> int:
     return int(row.get("id") or 0)
 
 
+def get_change_classification(change_id: int) -> Dict[str, Any]:
+    """
+    Fetch the deterministic classification fields written by sentinel triage.
+    Returns dict with risk_category, risk_bucket, similarity_score, classification_method.
+    Returns empty dict if change not found or fields not yet populated.
+    """
+    sb = get_supabase_client()
+    resp = (
+        sb.table("changes")
+        .select("risk_category, risk_bucket, similarity_score, classification_method")
+        .eq("id", int(change_id))
+        .limit(1)
+        .execute()
+    )
+    row = _safe_first(resp.data)
+    return row or {}
+
+
 def get_pending_agent_events(limit: int = 50) -> List[Dict[str, Any]]:
     sb = get_supabase_client()
     resp = (

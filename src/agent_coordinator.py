@@ -13,6 +13,7 @@ from .db import (
     get_pending_agent_events,
     mark_agent_events_processed,
     get_snapshot_text_by_id,
+    get_change_classification,
     insert_recommendation,
     insert_insight,
     mark_change_analyzed,
@@ -188,11 +189,40 @@ def build_deep_insight_prompt(
         "confidence": "number 0-1",
     }
 
+    has_fp = bool(fingerprint_context.strip())
+
     fp_section = (
         f"\nFINGERPRINT TECHNICAL EVIDENCE:\n{fingerprint_context[:5000]}\n"
-        if fingerprint_context.strip()
-        else "\nFINGERPRINT TECHNICAL EVIDENCE:\nNone available.\n"
+        if has_fp
+        else "\nFINGERPRINT TECHNICAL EVIDENCE:\nNone available for this event.\n"
     )
+
+    if has_fp:
+        grounding_instructions = (
+            "FINGERPRINT EVIDENCE IS AVAILABLE. You MUST ground at least 2 recommended actions "
+            "in the retrieved Fingerprint evidence.\n"
+            "When grounding recommendations, prefer concrete references to retrieved modules, files, "
+            "identifier providers, signal collection logic, fallback behavior, device profiling logic, "
+            "kernel or SDK related signals, security providers, emulator or tamper signals, and integrity checks.\n"
+            "If evidence references AndroidIdProvider, Settings.Secure.getString, versioned signal sets, "
+            "Android version, SDK version, kernel version, encryption status, or security providers, convert "
+            "that into concrete actions such as validation, regression testing, monitoring, fallback review, "
+            "or feature and rule updates.\n"
+            "At least 2 recommended_actions must explicitly mention a retrieved signal, provider, module, "
+            "file, or fallback behavior.\n"
+            "Do not overclaim. If evidence is weak, explicitly recommend engineering validation or targeted monitoring.\n"
+        )
+    else:
+        grounding_instructions = (
+            "NO FINGERPRINT EVIDENCE IS AVAILABLE FOR THIS EVENT. Ground your recommendations in the "
+            "technical details present in the EVENT SUMMARY and GENERAL CONTEXT instead.\n"
+            "Focus on: specific CVE IDs mentioned, affected Android components or versions, "
+            "patch levels, API changes, policy sections, or vulnerability types present in the content.\n"
+            "Recommended actions should reference concrete details from the content - "
+            "e.g. specific CVE IDs to track, affected components to test, patch levels to validate, "
+            "API behaviors to monitor, or policy requirements to implement.\n"
+            "Do not reference Fingerprint SDK modules or files since none were retrieved.\n"
+        )
 
     return (
         f"SOURCE: {url}\n\n"
@@ -203,25 +233,16 @@ def build_deep_insight_prompt(
         "Return JSON only. Do not include markdown.\n"
         "Make recommendations specific to security notes and risk models: "
         "signals or telemetry to monitor, rules or features to update, tests to add, and what to validate.\n"
-        "If Fingerprint technical evidence is available, you MUST ground at least 2 recommended actions "
-        "in the retrieved Fingerprint evidence.\n"
-        "When grounding recommendations, prefer concrete references to retrieved modules, files, identifier providers, "
-        "signal collection logic, fallback behavior, device profiling logic, kernel or SDK related signals, "
-        "security providers, emulator or tamper signals, and integrity related checks.\n"
-        "If evidence references AndroidIdProvider, Settings.Secure.getString, versioned signal sets, Android version, "
-        "SDK version, kernel version, encryption status, or security providers, convert that into concrete actions "
-        "such as validation, regression testing, monitoring, fallback review, or feature and rule updates.\n"
-        "At least 2 recommended_actions should explicitly mention a retrieved signal, provider, module, file, or "
-        "fallback behavior when Fingerprint evidence is present.\n"
-        "Do not overclaim. If evidence is weak, explicitly recommend engineering validation or targeted monitoring.\n"
+        f"{grounding_instructions}"
         "Recommended actions should be operational and specific, not generic. Prefer phrasing like "
         "'validate identifier fallback behavior', 'monitor null-rate changes in Android ID collection', "
-        "'regression test signal completeness across patch levels', or 'review module-level impact in retrieved files'.\n"
+        "'regression test signal completeness across patch levels', 'track exploitation of CVE-XXXX-XXXXX "
+        "across device fleet', or 'update risk rules to reflect patch level 2026-03-05 enforcement'.\n"
         f"Schema:\n{schema}"
     )
 
 
-def rag_context_from_text(text: str, top_k: int) -> str:
+def rag_context_from_text(text: str, top_k: int, source_id: Optional[int] = None) -> str:
     t = (text or "").strip()
     if not t:
         return ""
@@ -229,10 +250,14 @@ def rag_context_from_text(text: str, top_k: int) -> str:
     q = t[:1200]
     q_emb = embed_texts([q], is_query=True)[0]
 
+    # Filter to same source so RAG context doesn't cross-contaminate
+    # e.g. a CISA KEV event should not retrieve fingerprint SDK chunks
+    filter_sid = str(source_id) if source_id else None
+
     resp = vector_search(
         query_embedding=q_emb,
         match_count=top_k,
-        filter_source_id=None,
+        filter_source_id=filter_sid,
         filter_kind=None,
     )
     rows = resp.data or []
@@ -258,14 +283,27 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
     if not _bool_env("FINGERPRINT_ENABLED", True):
         return False
 
+    # Primary gate: only enrich with fingerprint context when the sentinel
+    # classifier assigned a category where device signals are directly relevant.
+    # CISA KEV, NVD CVEs for non-Android components, policy updates, and
+    # general platform updates do not benefit from fingerprint SDK evidence.
+    FINGERPRINT_CATEGORIES = {"device_integrity", "fraud_signal_degradation"}
+    risk_category = str(ev.get("risk_category") or "").lower().strip()
+
+    # If risk_category is populated (new sentinel), use it as the sole gate
+    if risk_category:
+        return risk_category in FINGERPRINT_CATEGORIES
+
+    # Legacy fallback for events created before risk_category field existed:
+    # use the old score + tag + keyword approach
     min_local_risk = _as_int(os.getenv("FINGERPRINT_MIN_LOCAL_RISK", "40"), 40)
-    min_relevance = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "40"), 40)
+    min_relevance  = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "40"), 40)
 
     local_risk = _as_int(ev.get("local_risk_score"), 0)
-    relevance = _as_int(ev.get("relevance_score"), 0)
-    tags = _tags(ev)
-    title = str(ev.get("title") or "").lower()
-    summary = str(ev.get("summary") or "").lower()
+    relevance  = _as_int(ev.get("relevance_score"), 0)
+    tags       = _tags(ev)
+    title      = str(ev.get("title") or "").lower()
+    summary    = str(ev.get("summary") or "").lower()
 
     if local_risk >= min_local_risk:
         return True
@@ -286,26 +324,10 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
 
     keyword_text = f"{title} {summary}"
     keyword_matches = [
-        "android id",
-        "device id",
-        "identifier",
-        "signal",
-        "integrity",
-        "permission",
-        "attestation",
-        "sdk",
-        "emulator",
-        "root",
-        "tamper",
-        "fraud",
-        "telemetry",
-        "play integrity",
-        "fingerprinting",
-        "device profile",
-        "security bulletin",
-        "vulnerability",
-        "policy",
-        "patch",
+        "android id", "device id", "identifier", "signal", "integrity",
+        "permission", "attestation", "sdk", "emulator", "root", "tamper",
+        "fraud", "telemetry", "play integrity", "fingerprinting",
+        "device profile", "security bulletin", "vulnerability", "policy", "patch",
     ]
     return any(k in keyword_text for k in keyword_matches)
 
@@ -491,27 +513,35 @@ def main() -> int:
             try:
                 url = get_source_url(source_id) or f"source_id={source_id}"
                 snap_text = get_snapshot_text_by_id(snapshot_id) if snapshot_id else ""
-                context = rag_context_from_text(snap_text, top_k=top_k)
+                context = rag_context_from_text(snap_text, top_k=top_k, source_id=source_id)
 
-                fingerprint_context = ""
-                use_fp = should_use_fingerprint(ev)
+                # Fetch sentinel classification so risk_category is available for logging
+                if change_id > 0:
+                    classification = get_change_classification(change_id)
+                    ev["risk_category"] = classification.get("risk_category", "")
+                    ev["risk_bucket"]   = classification.get("risk_bucket", "")
+
+                # Always attempt fingerprint retrieval for every event.
+                # If the fingerprint vector store returns results they are used
+                # for grounding. If nothing is returned the prompt falls back to
+                # grounding recommendations in CVE/patch/policy details from the
+                # event summary and RAG context instead.
+                stats["fingerprint_attempted"] += 1
+                fingerprint_context = fingerprint_context_from_event(
+                    title=title,
+                    summary=summary,
+                    tags=tags,
+                    top_k=fingerprint_top_k,
+                )
+                fp_used = bool(fingerprint_context.strip())
+                if fp_used:
+                    stats["fingerprint_used"] += 1
 
                 _debug(
-                    f"[FP] event_id={ev_id} use_fp={use_fp} "
-                    f"local_risk={ev.get('local_risk_score')} "
-                    f"relevance={ev.get('relevance_score')} tags={tags}"
+                    f"[FP] event_id={ev_id} fp_used={fp_used} "
+                    f"risk_category={ev.get('risk_category')} "
+                    f"local_risk={ev.get('local_risk_score')} tags={tags}"
                 )
-
-                if use_fp:
-                    stats["fingerprint_attempted"] += 1
-                    fingerprint_context = fingerprint_context_from_event(
-                        title=title,
-                        summary=summary,
-                        tags=tags,
-                        top_k=fingerprint_top_k,
-                    )
-                    if fingerprint_context.strip():
-                        stats["fingerprint_used"] += 1
 
                 prompt = build_deep_insight_prompt(
                     url=url,
@@ -556,7 +586,7 @@ def main() -> int:
 
                 final_actions = actions or _default_actions(
                     final_risk=final_risk,
-                    has_fingerprint=bool(fingerprint_context.strip()),
+                    has_fingerprint=fp_used,
                 )
 
                 if change_id > 0 and source_id > 0 and snapshot_id > 0:
@@ -603,7 +633,7 @@ def main() -> int:
                         "snapshot_id": snapshot_id,
                         "priority": priority,
                         "final_risk_score": final_risk,
-                        "fingerprint_used": bool(fingerprint_context.strip()),
+                        "fingerprint_used": fp_used,
                     },
                 )
 
