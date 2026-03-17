@@ -135,6 +135,32 @@ def update_change_triage_fields(
     ).eq("id", int(change_id)).execute()
 
 
+def update_change_classification_fields(
+    change_id: int,
+    risk_category: str,
+    risk_bucket: str,
+    similarity_score: float,
+    classification_method: str,
+) -> None:
+    """
+    Write the deterministic classification results to the changes table.
+    Called before update_change_triage_fields so classification data is
+    always persisted even if the LLM rationale step later fails.
+    Requires the following columns to exist on the changes table:
+      risk_category TEXT, risk_bucket TEXT,
+      similarity_score NUMERIC(5,4), classification_method TEXT
+    """
+    sb = get_supabase_client()
+    sb.table("changes").update(
+        {
+            "risk_category":         str(risk_category),
+            "risk_bucket":           str(risk_bucket),
+            "similarity_score":      float(similarity_score),
+            "classification_method": str(classification_method),
+        }
+    ).eq("id", int(change_id)).execute()
+
+
 def mark_change_analyzed(change_id: int) -> None:
     sb = get_supabase_client()
     sb.table("changes").update(
@@ -148,6 +174,26 @@ def mark_change_analyzed(change_id: int) -> None:
 # ---------------------------
 # Vector chunks (pgvector)
 # ---------------------------
+
+def get_snapshot_embeddings(snapshot_id: int) -> List[List[float]]:
+    """
+    Fetch all chunk embeddings stored in vector_chunks for a given snapshot_id.
+    Returns a list of embedding vectors (each a list of floats).
+    Used by the sentinel triage agent to build a document-level embedding by
+    averaging chunk embeddings - avoids re-embedding already-stored content.
+    Returns empty list if no chunks found (e.g. snapshot was skipped by embedder).
+    """
+    sb = get_supabase_client()
+    resp = (
+        sb.table(VECTOR_TABLE)
+        .select("embedding")
+        .eq("snapshot_id", int(snapshot_id))
+        .order("chunk_index")
+        .execute()
+    )
+    rows = resp.data or []
+    return [row["embedding"] for row in rows if row.get("embedding")]
+
 
 def upsert_vector_chunks(rows: List[Dict[str, Any]]) -> None:
     if not rows:

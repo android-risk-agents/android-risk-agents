@@ -35,7 +35,12 @@ jobs:
       MAX_RECOMMENDATIONS: "20"
 
       # Agent configs (only non-secret knobs belong here)
-      TRIAGE_THRESHOLD: "0.70"
+      TRIAGE_THRESHOLD: "0.35"
+
+      # Embedding similarity classification thresholds
+      # MIN_SIMILARITY_THRESHOLD: below this the category match is unreliable -> "general"
+      # TRIAGE_THRESHOLD: similarity must meet this for medium/low bucket changes to be triaged
+      MIN_SIMILARITY_THRESHOLD: "0.30"
 
       # Use full NIM model ids
       MODEL_TRIAGE: "google/gemma-2-9b-it"
@@ -109,6 +114,7 @@ jobs:
 
           AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
           TRIAGE_THRESHOLD: ${{ env.TRIAGE_THRESHOLD }}
+          MIN_SIMILARITY_THRESHOLD: ${{ env.MIN_SIMILARITY_THRESHOLD }}
           MODEL_TRIAGE: ${{ env.MODEL_TRIAGE }}
           DEBUG_LLM: ${{ env.DEBUG_LLM }}
         run: python -m src.agent_sentinel_triage

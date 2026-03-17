@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-from typing import Dict, Any, TypedDict, List
+import math
+from typing import Dict, Any, TypedDict, List, Tuple, Optional
 
 from src.db import (
     create_agent_run,
@@ -9,177 +10,492 @@ from src.db import (
     get_pending_changes_for_triage,
     get_source_url,
     get_snapshot_text_by_id,
+    get_snapshot_embeddings,
     update_change_triage_fields,
+    update_change_classification_fields,
     insert_agent_event,
-    audit_log
+    audit_log,
 )
 from src.llm_client import get_llm_client, chat_json
+from src.embedder import embed_texts  # used for category description embeddings only
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- schemas.py ---
-class SentinelTriageResult(TypedDict):
-    """
-    Schema validating the strict JSON output required from the Sentinel Triage Agent.
-    """
-    change_id: int
-    relevance_score: float      # Range: 0.0 to 1.0
-    severity_score: float       # Range: 0.0 to 1.0
-    confidence_score: float     # Range: 0.0 to 1.0
-    tags: List[str]             # Max 8 items, each max 60 chars
-    category: str               # e.g., permissions, device integrity, policy, network, malware, auth
-    decision: str               # Must be exactly one of: "triage", "ignore", "needs_review"
-    rationale: str              # Brief explanation of the decision
 
-# --- prompts.py ---
-SYSTEM_TRIAGE = """You are the Sentinel Triage Agent, an expert in Android and digital fraud risk monitoring.
-Your job is to compare an OLD snapshot text with a NEW snapshot text and decide its relevance to fraud, malware, security, or compliance risk.
+# =============================================================================
+# RISK TAXONOMY
+# Fixed category definitions used for deterministic embedding-similarity
+# classification. These descriptions are embedded once at agent startup and
+# reused for every change in the run. Adding or editing a category here is
+# the only change needed to extend the taxonomy.
+# =============================================================================
 
-CRITICAL INSTRUCTIONS:
-1. Be conservative: if unsure, set decision to 'needs_review' (do not ignore uncertain items).
-2. You MUST output your response in strictly valid JSON format.
-3. Provide absolutely NO markdown formatting, NO conversational text, and NO markdown code fences (like ```json). Just the raw JSON object.
-4. If this is a BASELINE analysis, you MUST set the decision to "triage" and relevance_score >= 0.75, because fresh runs must always be recorded.
-5. Provide a 3-4 sentence summary in the rationale. The Coordinator Agent heavily relies on this summary for actionable insights.
-6. Use exactly this JSON schema:
+RISK_CATEGORIES: List[Dict[str, Any]] = [
+    {
+        "id": "device_integrity",
+        "label": "Device Integrity",
+        "base_risk": "high",
+        "description": (
+            "Changes related to Android device attestation, Play Integrity API, "
+            "SafetyNet, bootloader state, root detection, emulator detection, "
+            "hardware-backed keystore, TEE (Trusted Execution Environment), "
+            "verified boot, device fingerprinting signals, tamper detection, "
+            "anti-cheat mechanisms, and device authenticity verification."
+        ),
+    },
+    {
+        "id": "fraud_signal_degradation",
+        "label": "Fraud Signal Degradation",
+        "base_risk": "high",
+        "description": (
+            "Changes that reduce the reliability or availability of fraud detection "
+            "signals on Android: deprecation of Android ID, changes to IMEI or "
+            "hardware identifier access, advertising ID opt-out policy changes, "
+            "sensor permission restrictions, reduction of device signal fidelity, "
+            "identifier randomisation, privacy sandbox changes affecting attribution, "
+            "and removal of previously available risk signals."
+        ),
+    },
+    {
+        "id": "permission_changes",
+        "label": "Permission Changes",
+        "base_risk": "medium",
+        "description": (
+            "New or modified Android runtime permissions, dangerous permission "
+            "groups, background location restrictions, microphone and camera "
+            "indicators, READ_PHONE_STATE changes, MANAGE_EXTERNAL_STORAGE, "
+            "notification permission requirements, health and fitness permissions, "
+            "nearby devices permissions, and permission auto-revocation policy changes."
+        ),
+    },
+    {
+        "id": "policy_compliance",
+        "label": "Policy and Compliance",
+        "base_risk": "medium",
+        "description": (
+            "Google Play Store policy updates, developer content policy changes, "
+            "financial services app requirements, loan app regulations, target SDK "
+            "version enforcement deadlines, data safety section requirements, "
+            "Play billing policy, app review policy changes, GDPR or CCPA related "
+            "platform changes, and regulatory compliance requirements for Android apps."
+        ),
+    },
+    {
+        "id": "network_security",
+        "label": "Network Security",
+        "base_risk": "medium",
+        "description": (
+            "Android network security configuration changes, cleartext traffic "
+            "restrictions, certificate pinning, TLS version enforcement, "
+            "Private DNS (DNS-over-TLS), VPN permission changes, network "
+            "permission restrictions, WebView security updates, and changes "
+            "to how Android handles SSL/TLS certificates or proxies."
+        ),
+    },
+    {
+        "id": "malware_exposure",
+        "label": "Malware Exposure",
+        "base_risk": "high",
+        "description": (
+            "Active Android malware campaigns, exploit-in-the-wild CVEs targeting "
+            "Android, banking trojans, spyware, adware, ransomware targeting Android "
+            "devices, zero-day vulnerabilities in Android framework or kernel, "
+            "privilege escalation exploits, remote code execution vulnerabilities, "
+            "and CISA Known Exploited Vulnerabilities affecting Android."
+        ),
+    },
+    {
+        "id": "platform_update",
+        "label": "Platform Update",
+        "base_risk": "low",
+        "description": (
+            "General Android OS version releases, Android security patch level "
+            "updates without active exploits, new Android API additions, SDK "
+            "updates, Android Studio tooling changes, Gradle plugin updates, "
+            "and routine monthly security bulletins with no critical or high "
+            "severity vulnerabilities in use by attackers."
+        ),
+    },
+    {
+        "id": "general",
+        "label": "General",
+        "base_risk": "low",
+        "description": (
+            "Miscellaneous Android ecosystem news, blog posts, documentation "
+            "updates, community announcements, and changes that do not directly "
+            "affect security, fraud risk, device integrity, or compliance."
+        ),
+    },
+]
 
-{
-  "change_id": <int, the change_id provided in the prompt>,
-  "relevance_score": <float 0.0-1.0>,
-  "severity_score": <float 0.0-1.0>,
-  "confidence_score": <float 0.0-1.0>,
-  "tags": [<list of up to 8 short lowercase string tags>],
-  "category": <string, one of: permissions, device integrity, policy, network, malware, auth, general>,
-  "decision": <string, exactly one of: "triage", "ignore", "needs_review">,
-  "rationale": <string, a 3-4 sentence summary of your findings. This summary will be used directly by the coordinator agent as context for actionable insights. Make it comprehensive.>
+# =============================================================================
+# RISK BUCKET RULES
+# Maps (base_risk, similarity_score) -> risk_bucket and decision.
+# All thresholds are configurable via ENV so you can tune without code changes.
+# =============================================================================
+
+# Similarity score below which a category match is considered unreliable.
+# Below this threshold the change is classified as "general" regardless of
+# which category had the highest cosine similarity.
+MIN_SIMILARITY_THRESHOLD = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.30"))
+
+# Relevance score (0-1 cosine similarity) thresholds for triage decision.
+# Changes with similarity >= TRIAGE_THRESHOLD go to triage; below -> ignore.
+# This replaces the old LLM-generated relevance_score threshold.
+TRIAGE_THRESHOLD = float(os.getenv("TRIAGE_THRESHOLD", "0.35"))
+
+# Risk bucket boundaries by base_risk level + similarity score.
+# base_risk=high: high bucket if sim >= 0.45, medium if >= 0.35, else low
+# base_risk=medium: high bucket if sim >= 0.55, medium if >= 0.40, else low
+# base_risk=low: always low bucket regardless of similarity
+BUCKET_RULES: Dict[str, List[Tuple[float, str]]] = {
+    "high":   [(0.45, "high"), (0.35, "medium"), (0.0, "low")],
+    "medium": [(0.55, "high"), (0.40, "medium"), (0.0, "low")],
+    "low":    [(0.0, "low")],
 }
-"""
 
-def build_prompt(old_text: str, new_text: str, url: str, baseline: bool, change_id: int) -> str:
+
+# =============================================================================
+# EMBEDDING CACHE
+# Category descriptions are embedded once per agent run and cached here.
+# This avoids re-embedding the same 8 descriptions for every change.
+# =============================================================================
+
+_CATEGORY_EMBEDDINGS: Optional[List[Tuple[Dict[str, Any], List[float]]]] = None
+
+
+def _get_category_embeddings() -> List[Tuple[Dict[str, Any], List[float]]]:
     """
-    Creates the exact user prompt sent to the LLM.
+    Embed all risk category descriptions and cache the result.
+    Returns list of (category_dict, embedding_vector) pairs.
     """
-    # Trim to ~4500 characters to ensure we stay within prompt context limits
-    MAX_CHARS = 4500
-    safe_old = (old_text or "")[:MAX_CHARS]
-    safe_new = (new_text or "")[:MAX_CHARS]
+    global _CATEGORY_EMBEDDINGS
+    if _CATEGORY_EMBEDDINGS is not None:
+        return _CATEGORY_EMBEDDINGS
 
-    header = (
-        "This is a BASELINE analysis (no previous snapshot exists)."
-        if baseline else
-        "This is a DIFF analysis (comparing previous snapshot to new snapshot)."
-    )
+    descriptions = [c["description"] for c in RISK_CATEGORIES]
+    # embed_texts returns normalised embeddings (nomic uses search_document prefix)
+    embeddings = embed_texts(descriptions, is_query=False)
 
-    prompt = f"{header}\n\nSource URL: {url}\nChange ID: {change_id}\n\n=== OLD TEXT (Trimmed) ===\n{safe_old if safe_old else '[NONE]'}\n\n=== NEW TEXT (Trimmed) ===\n{safe_new if safe_new else '[NONE]'}\n\nAnalyze the changes (or the new text if baseline). Output exactly ONE raw JSON object matching the required schema. Ensure you include the change_id!"
+    _CATEGORY_EMBEDDINGS = list(zip(RISK_CATEGORIES, embeddings))
+    logger.info(f"Category embeddings computed for {len(_CATEGORY_EMBEDDINGS)} categories.")
+    return _CATEGORY_EMBEDDINGS
 
-    return prompt
 
-# --- validate.py ---
-def _as_float(v: Any, default: float = 0.0) -> float:
-    try:
-        val = float(v)
-        return max(0.0, min(1.0, val))  # Clamp between 0.0 and 1.0
-    except (ValueError, TypeError):
-        return default
+# =============================================================================
+# CLASSIFICATION LOGIC
+# Pure functions - no LLM, fully deterministic given the same embedder.
+# =============================================================================
 
-def _as_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except (ValueError, TypeError):
-        return default
 
-def _as_tags(v: Any) -> list[str]:
-    if not isinstance(v, list):
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    """
+    Compute cosine similarity between two pre-normalised vectors.
+    embed_texts() with normalize_embeddings=True means dot product == cosine sim.
+    """
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    # Clamp to [-1, 1] to handle floating point drift
+    return max(-1.0, min(1.0, dot))
+
+
+def _average_embeddings(embeddings: List[List[float]]) -> List[float]:
+    """
+    Average a list of chunk embeddings into a single document-level vector.
+    Since nomic embeddings are already L2-normalised per chunk, averaging
+    gives a reasonable centroid. We re-normalise the result so cosine
+    similarity comparisons remain valid.
+    """
+    if not embeddings:
         return []
-    safe_tags = []
-    for t in v:
-        if isinstance(t, str):
-            clean = t.strip()[:60].lower()
-            if clean:
-                safe_tags.append(clean)
-    return safe_tags[:8]
+    dim = len(embeddings[0])
+    avg = [0.0] * dim
+    for emb in embeddings:
+        for i, v in enumerate(emb):
+            avg[i] += v
+    n = len(embeddings)
+    avg = [v / n for v in avg]
 
-def parse_and_validate_triage_json(raw_text: str, fallback_change_id: int) -> Dict[str, Any]:
+    # Re-normalise
+    magnitude = math.sqrt(sum(v * v for v in avg))
+    if magnitude > 0:
+        avg = [v / magnitude for v in avg]
+    return avg
+
+
+def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]:
     """
-    Takes the raw string from the LLM, attempts to extract JSON,
-    and returns a guaranteed structured dict matching SentinelTriageResult.
+    Classify a change using pre-stored vector_chunks embeddings for the
+    snapshot. Averages all chunk embeddings into one document-level vector,
+    then compares cosine similarity against all risk category embeddings.
+
+    Falls back to embedding `fallback_text` directly if no chunks are found
+    in vector_chunks (e.g. snapshot was too short and skipped by embedder,
+    or EMBED_BASELINE_ON_FIRST_SNAPSHOT=false).
+
+    Returns deterministic classification dict - same inputs always produce
+    the same output given the same embedder model.
     """
-    raw_text = (raw_text or "").strip()
-    
-    # Attempt to strip accidental markdown fences
-    if raw_text.startswith("```"):
-        parts = raw_text.split("```")
-        if len(parts) >= 2:
-            raw_text = parts[1].replace("json", "", 1).strip()
+    category_embeddings = _get_category_embeddings()
 
-    parsed = {}
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        # Fallback to finding the first and last curly braces if the LLM outputted conversational garbage
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                parsed = json.loads(raw_text[start : end + 1])
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse inner JSON: {e}")
-        else:
-            logger.error(f"Could not locate JSON brackets in LLM output: {raw_text[:200]}...")
+    # ── Get document embedding ────────────────────────────────────────────────
+    chunk_embeddings = get_snapshot_embeddings(snapshot_id)
 
-    if not isinstance(parsed, dict):
-        parsed = {}
-
-    decision = parsed.get("decision", "ignore").lower()
-    if decision not in ["triage", "ignore", "needs_review"]:
-        decision = "ignore"
-        
-    category = parsed.get("category", "general")
-    if not isinstance(category, str):
-        category = "general"
+    if chunk_embeddings:
+        doc_embedding = _average_embeddings(chunk_embeddings)
+        embedding_source = f"averaged_{len(chunk_embeddings)}_chunks"
+    elif fallback_text:
+        # Re-embed on the fly only as last resort
+        logger.warning(
+            f"No chunks found for snapshot_id={snapshot_id}, "
+            f"falling back to direct embedding."
+        )
+        doc_embedding = embed_texts([fallback_text[:6000]], is_query=True)[0]
+        embedding_source = "fallback_direct_embed"
     else:
-        category = category.lower()
-        valid_categories = {"permissions", "device integrity", "policy", "network", "malware", "auth", "general"}
-        if category not in valid_categories:
-            category = "general"
+        logger.error(f"No chunks and no fallback text for snapshot_id={snapshot_id}.")
+        return {
+            "risk_category":         "general",
+            "risk_category_label":   "General",
+            "risk_bucket":           "low",
+            "similarity_score":      0.0,
+            "classification_method": "embedding_similarity",
+            "decision":              "ignore",
+            "all_scores":            {},
+            "embedding_source":      "none",
+        }
 
-    # Enforce constraints and return the structured schema
+    # ── Score every category ──────────────────────────────────────────────────
+    scores: Dict[str, float] = {}
+    for cat, cat_emb in category_embeddings:
+        scores[cat["id"]] = _cosine_similarity(doc_embedding, cat_emb)
+
+    best_id    = max(scores, key=lambda k: scores[k])
+    best_score = scores[best_id]
+    best_cat   = next(c for c in RISK_CATEGORIES if c["id"] == best_id)
+
+    # Low-confidence fallback
+    if best_score < MIN_SIMILARITY_THRESHOLD:
+        best_cat   = next(c for c in RISK_CATEGORIES if c["id"] == "general")
+        best_id    = "general"
+        best_score = scores.get("general", best_score)
+
+    # ── Risk bucket ───────────────────────────────────────────────────────────
+    base_risk   = best_cat["base_risk"]
+    risk_bucket = "low"
+    for threshold, bucket in BUCKET_RULES[base_risk]:
+        if best_score >= threshold:
+            risk_bucket = bucket
+            break
+
+    # ── Decision ──────────────────────────────────────────────────────────────
+    if risk_bucket == "high":
+        decision = "triage"
+    elif best_score >= TRIAGE_THRESHOLD:
+        decision = "triage"
+    else:
+        decision = "ignore"
+
     return {
-        "change_id": _as_int(parsed.get("change_id"), fallback_change_id),
-        "relevance_score": _as_float(parsed.get("relevance_score"), 0.0),
-        "severity_score": _as_float(parsed.get("severity_score"), 0.0),
-        "confidence_score": _as_float(parsed.get("confidence_score"), 0.0),
-        "tags": _as_tags(parsed.get("tags")),
-        "category": category[:120],
-        "decision": decision,
-        "rationale": str(parsed.get("rationale", "No rationale provided"))[:2000]
+        "risk_category":         best_id,
+        "risk_category_label":   best_cat["label"],
+        "risk_bucket":           risk_bucket,
+        "similarity_score":      round(best_score, 4),
+        "classification_method": "embedding_similarity",
+        "decision":              decision,
+        "all_scores":            {k: round(v, 4) for k, v in scores.items()},
+        "embedding_source":      embedding_source,
     }
 
-# --- sentinel_agent.py ---
+
+# =============================================================================
+# LLM: RATIONALE + SUMMARY ONLY
+# The LLM no longer determines any scores. It only produces human-readable
+# narrative that the Coordinator agent uses for recommendations.
+# =============================================================================
+
+SYSTEM_RATIONALE = """You are the Sentinel Triage Agent, a senior analyst in Android fraud risk and mobile security intelligence.
+
+A deterministic classifier has already assigned a risk category and risk bucket to this event.
+Your only job is to produce a structured JSON summary that will be used by the Coordinator Agent
+to generate recommendations for fraud and security engineering teams.
+
+OUTPUT RULES:
+1. Return ONLY a raw JSON object. No markdown, no code fences, no preamble, no extra text.
+2. Do NOT override or question the risk_category or risk_bucket. They are fixed inputs.
+3. Write as if briefing a fraud analyst or risk engineer who needs to act immediately.
+4. Be specific: name CVE IDs, affected components, Android versions, API names, or policy sections
+   that appear in the content. Do not generalise when specifics are available.
+5. affected_signals must name concrete Android fraud/device signals that this event impacts
+   (e.g. "Android ID", "Play Integrity verdict", "SafetyNet attestation", "kernel version signal",
+   "IMEI access", "advertising ID", "bootloader state"). Leave empty array if none are affected.
+6. Use exactly this JSON schema - no extra fields:
+
+{
+  "rationale": "<4-5 sentences: what changed or was disclosed, which Android components or CVEs are involved, why it matters for fraud risk or device integrity, and what the downstream impact is on risk models or detection signals>",
+  "insight": "<2-3 sentences: the broader security implication beyond this single event - e.g. trend this fits into, attacker capability it enables, or compliance pressure it creates>",
+  "affected_signals": ["<signal 1>", "<signal 2>"],
+  "recommended_actions": ["<specific action 1>", "<specific action 2>", "<specific action 3>"]
+}"""
+
+
+def _detect_source_type(url: str) -> str:
+    """Derive a human-readable source label from the URL for prompt context."""
+    u = url.lower()
+    if "cisa.gov" in u:
+        return "CISA Known Exploited Vulnerabilities (KEV) catalog"
+    if "nvd.nist.gov" in u or "nvd" in u:
+        return "NVD CVE database (NIST)"
+    if "osv" in u or "osv-vulnerabilities" in u:
+        return "OSV Android vulnerability database (Google)"
+    if "source.android.com" in u and "bulletin" in u:
+        return "Android Security Bulletin (Google AOSP)"
+    if "android-developers.googleblog.com" in u or "atom.xml" in u:
+        return "Android Developers Blog"
+    if "play.google" in u or "developer-content-policy" in u:
+        return "Google Play Developer Policy Center"
+    if "developer.android.com" in u and "integrity" in u:
+        return "Play Integrity API documentation"
+    return "Android ecosystem source"
+
+
+def build_rationale_prompt(
+    change_text: str,
+    url: str,
+    classification: Dict[str, Any],
+    baseline: bool,
+    change_id: int,
+) -> str:
+    MAX_CHARS = 4000
+    safe_text = (change_text or "")[:MAX_CHARS]
+    source_type = _detect_source_type(url)
+    all_scores = classification.get("all_scores", {})
+
+    # Format all category scores for transparency so the LLM understands
+    # the classification context without being able to change it
+    scores_str = "  " + "\n  ".join(
+        f"{k}: {v}" for k, v in sorted(all_scores.items(), key=lambda x: -x[1])
+    ) if all_scores else "  (not available)"
+
+    return (
+        f"CHANGE ID: {change_id}\n"
+        f"SOURCE TYPE: {source_type}\n"
+        f"SOURCE URL: {url}\n"
+        f"ANALYSIS TYPE: {'BASELINE - first time this source has been ingested' if baseline else 'DIFF - content changed since last snapshot'}\n\n"
+        f"DETERMINISTIC CLASSIFICATION RESULTS:\n"
+        f"  Risk Category: {classification['risk_category_label']} ({classification['risk_category']})\n"
+        f"  Risk Bucket: {classification['risk_bucket'].upper()}\n"
+        f"  Similarity Score: {classification['similarity_score']} "
+        f"(cosine similarity to category description embedding)\n"
+        f"  Embedding Source: {classification.get('embedding_source', 'unknown')}\n"
+        f"  All Category Scores:\n{scores_str}\n\n"
+        f"CONTENT (trimmed to {MAX_CHARS} chars):\n"
+        f"{safe_text}\n\n"
+        f"Write the rationale, insight, affected_signals, and recommended_actions JSON for this event.\n"
+        f"Ground every claim in the content above. Do not invent CVEs, component names, or version numbers."
+    )
+
+
+def _parse_rationale_response(raw: Dict[str, Any]) -> Tuple[str, str, List[str], List[str]]:
+    """
+    Extract rationale, insight, affected_signals, and recommended_actions
+    from LLM response dict. Returns (rationale, insight, affected_signals, actions).
+    """
+    rationale = str(raw.get("rationale", "No rationale provided."))[:2000]
+    insight   = str(raw.get("insight", ""))[:1000]
+
+    affected = raw.get("affected_signals", [])
+    if not isinstance(affected, list):
+        affected = []
+    affected = [str(s)[:120] for s in affected[:6]]
+
+    actions = raw.get("recommended_actions", [])
+    if not isinstance(actions, list):
+        actions = []
+    actions = [str(a)[:300] for a in actions[:5]]
+
+    return rationale, insight, affected, actions
+
+
+# =============================================================================
+# SCHEMA (updated to include new deterministic fields)
+# =============================================================================
+
+class SentinelTriageResult(TypedDict):
+    change_id:              int
+    risk_category:          str
+    risk_category_label:    str
+    risk_bucket:            str
+    similarity_score:       float
+    classification_method:  str
+    decision:               str
+    rationale:              str
+    recommended_actions:    List[str]
+    tags:                   List[str]
+    # Legacy fields preserved for coordinator compatibility
+    relevance_score:        int    # mapped from risk_bucket (high=90, medium=60, low=30)
+    local_risk_score:       int    # same mapping
+
+
+def _bucket_to_score(bucket: str) -> int:
+    """Map risk bucket to legacy int score (0-100) for coordinator compatibility."""
+    return {"high": 90, "medium": 60, "low": 30}.get(bucket, 30)
+
+
+def _derive_tags(classification: Dict[str, Any], url: str) -> List[str]:
+    """Derive tags from classification result for filtering/search."""
+    tags = [
+        classification["risk_category"],
+        classification["risk_bucket"],
+        "embedding-classified",
+    ]
+    if "android" in url.lower() or "source.android" in url.lower():
+        tags.append("android-bulletin")
+    if "cisa" in url.lower():
+        tags.append("cisa-kev")
+    if "nvd" in url.lower():
+        tags.append("nvd-cve")
+    if "osv" in url.lower():
+        tags.append("osv")
+    return tags[:8]
+
+
+# =============================================================================
+# BASELINE ENFORCEMENT
+# Baseline changes (first snapshot ever for a source) are always triaged
+# regardless of classification score. This preserves the existing behaviour.
+# =============================================================================
+
 def _is_baseline_init(change: Dict[str, Any]) -> bool:
-    """Detects baseline case (first-time snapshot)"""
     prev_id = change.get("prev_snapshot_id")
-    # Also check if diff_json type says baseline_init if needed
     diff_json = change.get("diff_json", {})
     if isinstance(diff_json, dict) and diff_json.get("type") == "baseline_init":
         return True
     return prev_id is None
 
+
+# =============================================================================
+# MAIN AGENT LOOP
+# =============================================================================
+
 def main():
     agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
-    threshold = float(os.getenv("TRIAGE_THRESHOLD", "0.7"))
-    
     vllm_model = os.getenv("VLLM_MODEL", os.getenv("MODEL_TRIAGE", "llama-3.1-8b-instant"))
-    
+
+    logger.info(
+        f"Starting {agent_name} | model={vllm_model} "
+        f"| triage_threshold={TRIAGE_THRESHOLD} "
+        f"| min_similarity={MIN_SIMILARITY_THRESHOLD} "
+        f"| classification=embedding_similarity"
+    )
+
     try:
         llm_client = get_llm_client()
     except Exception as e:
-        logger.error(f"Failed to initialize LLM client: {e}")
+        logger.error(f"Failed to initialise LLM client: {e}")
         return
-        
-    # Needs valid Supabase credentials stored in ENV (handled cleanly by src.db under the hood)
-    logger.info(f"Starting {agent_name} run with threshold {threshold} on model {vllm_model}")
 
     run_id = create_agent_run(run_name=agent_name, trigger="cron", llm_backend=vllm_model)
 
@@ -188,10 +504,14 @@ def main():
         "ignored": 0,
         "triaged": 0,
         "errors": 0,
-        "events_created": 0
+        "events_created": 0,
+        "llm_calls": 0,
     }
 
     try:
+        # Pre-compute category embeddings once for the whole run
+        _get_category_embeddings()
+
         changes = get_pending_changes_for_triage(limit=25)
         if not changes:
             logger.info("No pending changes found.")
@@ -201,111 +521,171 @@ def main():
         for ch in changes:
             change_id = ch.get("id")
             source_id = ch.get("source_id")
-            prev_id = ch.get("prev_snapshot_id")
-            new_id = ch.get("new_snapshot_id")
+            new_id    = ch.get("new_snapshot_id")
+            prev_id   = ch.get("prev_snapshot_id")
 
             if not change_id or not source_id or not new_id:
                 logger.warning(f"Skipping change {change_id}: missing identifiers")
                 stats["errors"] += 1
                 continue
-            
+
             baseline = _is_baseline_init(ch)
 
-            # Load texts
+            # ── Load snapshot texts ───────────────────────────────────────────
             old_text = "" if baseline else get_snapshot_text_by_id(prev_id)
             new_text = get_snapshot_text_by_id(new_id)
-            url = get_source_url(source_id)
+            url      = get_source_url(source_id)
 
-            user_prompt = build_prompt(old_text, new_text, url, baseline, change_id)
-            
-            # Route through the centralized llm_client
-            try:
-                raw_llm_dict = chat_json(
-                    client=llm_client,
-                    model=vllm_model,
-                    system=SYSTEM_TRIAGE,
-                    user=user_prompt,
-                    temperature=0.0,
-                    max_tokens=400
-                )
-                raw_llm_json = json.dumps(raw_llm_dict)
-                parsed_result = parse_and_validate_triage_json(raw_llm_json, fallback_change_id=change_id)
-                
-                # Fix 2: Enforce baseline rule in code
-                if baseline:
-                    parsed_result["decision"] = "triage"
-                    if parsed_result["relevance_score"] < 0.75:
-                        parsed_result["relevance_score"] = 0.75
-                        
-            except Exception as e:
-                logger.error(f"Failed to process LLM output for change {change_id}: {e}")
+            if not new_text:
+                logger.warning(f"Change {change_id}: empty snapshot text, skipping")
                 stats["errors"] += 1
-                audit_log(run_id, agent_name, "triage_error", "changes", change_id, {"error": str(e)})
                 continue
-                
-            stats["processed"] += 1
-            
-            # Extract final scores & map severity to local_risk_score since db schema wants local_risk_score
-            decision = parsed_result["decision"]
-            rel_score = parsed_result["relevance_score"]
-            risk_score = parsed_result["severity_score"] 
-            tags = parsed_result["tags"]
-            
-            # NOTE: We scale 0.0-1.0 to 0-100 since `update_change_triage_fields` expects `int(relevance_score)`
-            rel_score_int = int(rel_score * 100)
-            risk_score_int = int(risk_score * 100)
 
-            # Ignore path (never ignore baseline/fresh runs)
-            if not baseline and (decision == "ignore" or rel_score < threshold):
+            # ── Step 1: Deterministic embedding-similarity classification ─────
+            try:
+                classification = classify_change(
+                    snapshot_id=new_id,
+                    fallback_text=new_text[:6000] if new_text else "",
+                )
+            except Exception as e:
+                logger.error(f"Classification failed for change {change_id}: {e}")
+                stats["errors"] += 1
+                audit_log(run_id, agent_name, "classification_error", "changes", change_id, {"error": str(e)})
+                continue
+
+            logger.info(
+                f"Change {change_id} | category={classification['risk_category']} "
+                f"| bucket={classification['risk_bucket']} "
+                f"| sim={classification['similarity_score']} "
+                f"| decision={classification['decision']}"
+            )
+
+            # ── Baseline override: always triage first snapshots ──────────────
+            if baseline and classification["decision"] == "ignore":
+                classification["decision"] = "triage"
+                if classification["risk_bucket"] == "low":
+                    classification["risk_bucket"] = "medium"
+
+            decision = classification["decision"]
+
+            # ── Map to legacy int scores for coordinator compatibility ─────────
+            score_int = _bucket_to_score(classification["risk_bucket"])
+            tags      = _derive_tags(classification, url)
+
+            # ── Write deterministic classification fields to DB ───────────────
+            update_change_classification_fields(
+                change_id=change_id,
+                risk_category=classification["risk_category"],
+                risk_bucket=classification["risk_bucket"],
+                similarity_score=classification["similarity_score"],
+                classification_method=classification["classification_method"],
+            )
+
+            stats["processed"] += 1
+
+            # ── Ignore path ───────────────────────────────────────────────────
+            if decision == "ignore":
                 update_change_triage_fields(
                     change_id=change_id,
                     status="ignored",
-                    relevance_score=rel_score_int,
-                    local_risk_score=risk_score_int,
-                    tags=tags
+                    relevance_score=score_int,
+                    local_risk_score=score_int,
+                    tags=tags,
                 )
-                audit_log(run_id, agent_name, "triage_ignored", "changes", change_id, parsed_result)
+                audit_log(run_id, agent_name, "triage_ignored", "changes", change_id, classification)
                 stats["ignored"] += 1
-                logger.info(f"Change {change_id} IGNORED (Score: {rel_score})")
-            
-            # Triage path
-            else:
-                update_change_triage_fields(
+                logger.info(f"Change {change_id} IGNORED.")
+                continue
+
+            # ── Triage path: call LLM for rationale only ──────────────────────
+            rationale      = "No rationale generated."
+            insight        = ""
+            affected_signals: List[str] = []
+            rec_actions: List[str] = []
+
+            try:
+                rationale_prompt = build_rationale_prompt(
+                    change_text=new_text,
+                    url=url,
+                    classification=classification,
+                    baseline=baseline,
                     change_id=change_id,
-                    status="triaged",
-                    relevance_score=rel_score_int,
-                    local_risk_score=risk_score_int,
-                    tags=tags
                 )
-                
-                # Insert Agent Event for Coordinator
-                payload = {
-                    "source_id": source_id,
-                    "snapshot_id": new_id,
-                    "change_id": change_id,
-                    "agent_name": agent_name,
-                    "event_type": "baseline_init" if baseline else "diff_update",
-                    "title": f"Triage Alert: {parsed_result['category']}",
-                    "summary": parsed_result["rationale"],
-                    "tags": tags,
-                    "relevance_score": rel_score_int,
-                    "local_risk_score": risk_score_int,
-                    "status": "new"
-                }
-                
-                event_id = insert_agent_event(payload)
-                audit_log(run_id, agent_name, "triage_event_created", "agent_events", event_id, parsed_result)
-                stats["triaged"] += 1
-                stats["events_created"] += 1
-                logger.info(f"Change {change_id} TRIAGED -> Event {event_id} created.")
+                raw_llm = chat_json(
+                    client=llm_client,
+                    model=vllm_model,
+                    system=SYSTEM_RATIONALE,
+                    user=rationale_prompt,
+                    temperature=0.1,
+                    max_tokens=700,
+                )
+                rationale, insight, affected_signals, rec_actions = _parse_rationale_response(raw_llm)
+                stats["llm_calls"] += 1
+            except Exception as e:
+                logger.warning(f"LLM rationale failed for change {change_id}: {e} - using fallback.")
+                rationale = (
+                    f"Deterministic classifier assigned category "
+                    f"'{classification['risk_category_label']}' "
+                    f"(bucket={classification['risk_bucket']}, "
+                    f"similarity={classification['similarity_score']}). "
+                    f"LLM rationale unavailable."
+                )
+                # LLM failure does NOT block triage - classification already done
+
+            # Write triage status
+            update_change_triage_fields(
+                change_id=change_id,
+                status="triaged",
+                relevance_score=score_int,
+                local_risk_score=score_int,
+                tags=tags,
+            )
+
+            # Build summary for coordinator: combine rationale + insight
+            # so coordinator's EVENT SUMMARY field is as rich as possible
+            coordinator_summary = rationale
+            if insight:
+                coordinator_summary = f"{rationale}\n\nInsight: {insight}"
+
+            # Insert agent event for Coordinator (same schema as before)
+            event_payload = {
+                "source_id":    source_id,
+                "snapshot_id":  new_id,
+                "change_id":    change_id,
+                "agent_name":   agent_name,
+                "event_type":   "baseline_init" if baseline else "diff_update",
+                "title":        f"[{classification['risk_bucket'].upper()}] {classification['risk_category_label']}",
+                "summary":      coordinator_summary,
+                "tags":         tags,
+                "relevance_score":   score_int,
+                "local_risk_score":  score_int,
+                "status":       "new",
+            }
+
+            event_id = insert_agent_event(event_payload)
+            audit_log(
+                run_id, agent_name, "triage_event_created",
+                "agent_events", event_id,
+                {
+                    **classification,
+                    "rationale":        rationale,
+                    "insight":          insight,
+                    "affected_signals": affected_signals,
+                    "recommended_actions": rec_actions,
+                },
+            )
+            stats["triaged"] += 1
+            stats["events_created"] += 1
+            logger.info(f"Change {change_id} TRIAGED -> Event {event_id}.")
 
         finish_agent_run(run_id, "success", stats)
-        logger.info(f"Run completed successfully: {stats}")
+        logger.info(f"Run complete: {stats}")
 
     except Exception as e:
-        logger.error(f"Fatal error during {agent_name} run: {e}")
+        logger.error(f"Fatal error in {agent_name}: {e}")
         finish_agent_run(run_id, "failed", stats)
         raise
+
 
 if __name__ == "__main__":
     main()
