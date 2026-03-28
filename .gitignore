@@ -31,3 +31,4 @@ Thumbs.db
 scripts/
 
 streamlit_app_V1.py
+smoke_test_sentinel.py
