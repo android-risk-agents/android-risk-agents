@@ -1,0 +1,53 @@
+name: GCP vLLM Smoke Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    env:
+      LLM_BASE_URL: ${{ secrets.GCP_LLM_BASE_URL }}
+      NVIDIA_API_KEY: ${{ secrets.GCP_LLM_API_KEY }}
+      MODEL_TRIAGE: google/gemma-2-9b-it
+
+    steps:
+      - name: Show target host
+        run: |
+          echo "LLM_BASE_URL=$LLM_BASE_URL"
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          u = os.environ["LLM_BASE_URL"]
+          p = urlparse(u)
+          print("scheme:", p.scheme)
+          print("netloc:", p.netloc)
+          print("path:", p.path)
+          PY
+
+      - name: Test /v1/models
+        run: |
+          set -x
+          curl -v --connect-timeout 20 --max-time 40 \
+            -H "Authorization: Bearer $NVIDIA_API_KEY" \
+            "$LLM_BASE_URL/v1/models"
+
+      - name: Test /v1/chat/completions
+        run: |
+          set -x
+          curl -v --connect-timeout 20 --max-time 60 \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NVIDIA_API_KEY" \
+            "$LLM_BASE_URL/v1/chat/completions" \
+            -d '{
+              "model": "google/gemma-2-9b-it",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "INSTRUCTIONS:\nReturn only a JSON object.\n\nTASK:\nReturn exactly {\"ok\": true, \"source\": \"github-actions\"}"
+                }
+              ],
+              "temperature": 0.0,
+              "max_tokens": 40
+            }'
