@@ -12,19 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
-    # Keep embedding/vector config consistent across ALL steps
     env:
-      EMBEDDING_MODEL: "nomic"                 # baai_small | baai_base | nomic
-      VECTOR_DIM: "768"                       # 384 for baai_small, 768 for nomic/baai_base
-      VECTOR_TABLE: "vector_chunks"           # or "vector_chunks_768"
-      VECTOR_RPC_MATCH: "match_vector_chunks" # or "match_vector_chunks_768"
+      EMBEDDING_MODEL: "nomic"
+      VECTOR_DIM: "768"
+      VECTOR_TABLE: "vector_chunks"
+      VECTOR_RPC_MATCH: "match_vector_chunks"
 
       USER_AGENT: "android-risk-agents-bot/0.1 (github-actions)"
 
       EMBED_BASELINE_ON_FIRST_SNAPSHOT: "true"
       EMBED_DELTAS_ON_CHANGE: "true"
 
-      # First-run demo behavior
       INIT_BASELINE_AS_CHANGE: "true"
       BASELINE_MAX_SOURCES: "25"
 
@@ -34,22 +32,14 @@ jobs:
       RAG_TOP_K: "6"
       MAX_RECOMMENDATIONS: "20"
 
-      # Agent configs (only non-secret knobs belong here)
       TRIAGE_THRESHOLD: "0.35"
-
-      # Embedding similarity classification thresholds
-      # MIN_SIMILARITY_THRESHOLD: below this the category match is unreliable -> "general"
-      # TRIAGE_THRESHOLD: similarity must meet this for medium/low bucket changes to be triaged
       MIN_SIMILARITY_THRESHOLD: "0.30"
 
-      # Use full NIM model ids
       MODEL_TRIAGE: "google/gemma-2-9b-it"
       MODEL_ANALYZE: "google/gemma-2-9b-it"
 
-      # LLM debug
       DEBUG_LLM: "true"
 
-      # Fingerprint enrichment config
       FINGERPRINT_ENABLED: "true"
       FINGERPRINT_MIN_LOCAL_RISK: "50"
       FINGERPRINT_MIN_RELEVANCE: "50"
@@ -107,10 +97,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-
-          # single knob: update this secret when switching endpoints (NIM vs vLLM)
-          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          NVIDIA_API_KEY: ${{ secrets.GCP_LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.GCP_LLM_BASE_URL }}
 
           AGENT_NAME: ${{ env.AGENT_NAME_TRIAGE }}
           TRIAGE_THRESHOLD: ${{ env.TRIAGE_THRESHOLD }}
@@ -124,8 +112,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          NVIDIA_API_KEY: ${{ secrets.GCP_LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.GCP_LLM_BASE_URL }}
 
           AGENT_NAME: ${{ env.AGENT_NAME_COORD }}
           MODEL_ANALYZE: ${{ env.MODEL_ANALYZE }}
