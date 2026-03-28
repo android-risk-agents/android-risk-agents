@@ -25,6 +25,16 @@ def _debug_enabled() -> bool:
     return str(os.getenv("DEBUG_LLM", "")).strip().lower() in ("1", "true", "yes", "y")
 
 
+def _supports_system_role() -> bool:
+    """
+    Some OpenAI-compatible backends reject system role messages.
+    For the GCP vLLM Gemma endpoint, set:
+      LLM_SUPPORTS_SYSTEM_ROLE=false
+    """
+    v = str(os.getenv("LLM_SUPPORTS_SYSTEM_ROLE", "true")).strip().lower()
+    return v in ("1", "true", "yes", "y")
+
+
 def _safe_url_for_logs(full_url: str) -> str:
     """
     GitHub Actions will redact secrets from logs, which can turn URLs into "***".
@@ -53,7 +63,6 @@ def _normalize_model(model: str) -> str:
         return m
     if "/" in m:
         return m
-    # gemma models on NIM are under google/*
     if m.startswith("gemma-"):
         return f"google/{m}"
     return m
@@ -65,10 +74,10 @@ _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
 _RE_MISSING_COMMA_BEFORE_KEY = re.compile(r'(["}\]])\s*(")')
 
 # Safe fixes for common LLM JSON glitches:
-_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")  # ,: "key"
-_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")  # ,: } or ,: ]
-_RE_DANGLING_COMMA_COLON_EOF = re.compile(r",\s*:\s*$")  # ,: <EOF>
-_RE_DANGLING_QUOTE_COMMA_COLON_CLOSE = re.compile(r'"\s*,\s*:\s*([}\]])')  # "...",: } or ]
+_RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")
+_RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")
+_RE_DANGLING_COMMA_COLON_EOF = re.compile(r",\s*:\s*$")
+_RE_DANGLING_QUOTE_COMMA_COLON_CLOSE = re.compile(r'"\s*,\s*:\s*([}\]])')
 
 
 def _strip_code_fences(s: str) -> str:
@@ -270,11 +279,14 @@ def _extract_content_from_nim_envelope(raw_text: str) -> str:
 @dataclass
 class NimClient:
     """
-    Minimal OpenAI-compatible client for NVIDIA NIM.
+    Minimal OpenAI-compatible client for NVIDIA NIM / vLLM style backends.
 
     base_url may be either:
       - https://integrate.api.nvidia.com
       - https://integrate.api.nvidia.com/v1
+      - http://<host>:8000
+      - http://<host>:8000/v1
+
     We normalize so the final endpoint is always:
       .../v1/chat/completions
     """
@@ -314,18 +326,30 @@ class NimClient:
 
         model_id = _normalize_model(model)
 
-        payload: Dict[str, Any] = {
-            "model": model_id,
-            "messages": [
+        forced_no_system = not _supports_system_role()
+
+        if forced_no_system:
+            combined = (
+                "INSTRUCTIONS:\n"
+                f"{(system or '').strip()}\n\n"
+                "TASK:\n"
+                f"{(user or '').strip()}\n"
+            )
+            messages = [{"role": "user", "content": combined}]
+        else:
+            messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
-            ],
+            ]
+
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
 
         last_err: Optional[str] = None
-        forced_no_system = False
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -345,7 +369,7 @@ class NimClient:
 
                     last_err = f"HTTP {resp.status_code}: {head}"
 
-                    # Safe fallback for backends/models that reject "system" role
+                    # Fallback for backends/models that reject "system" role
                     if (not forced_no_system) and ("System role not supported" in head):
                         forced_no_system = True
                         combined = (
@@ -369,7 +393,6 @@ class NimClient:
                         f"{_remove_illegal_control_chars(raw_text[:900])}"
                     )
 
-                # Envelope parse
                 try:
                     content = _extract_content_from_nim_envelope(raw_text)
                 except Exception as e:
@@ -385,7 +408,6 @@ class NimClient:
                         f"{_remove_illegal_control_chars(content)[:900]}"
                     )
 
-                # Content parse
                 try:
                     parsed = _extract_first_json_obj(content)
                 except json.JSONDecodeError as e:
@@ -395,7 +417,6 @@ class NimClient:
                         print(f"[NIM] json_error rid={rid}: {last_err[:400]}")
                         print(f"[NIM] json_candidate_head rid={rid}: {candidate[:900]}")
 
-                    # Force deterministic output on subsequent tries
                     if payload.get("temperature", 0.0) != 0.0:
                         payload["temperature"] = 0.0
 
@@ -425,11 +446,13 @@ class NimClient:
 
 def get_llm_client() -> NimClient:
     """
-    Uses a single configurable secret:
+    Uses a single configurable base URL:
       LLM_BASE_URL
     """
     base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    return NimClient(base_url=base_url)
+    timeout_s = int(os.getenv("LLM_TIMEOUT_S", "60"))
+    max_retries = int(os.getenv("LLM_MAX_RETRIES", "3"))
+    return NimClient(base_url=base_url, timeout_s=timeout_s, max_retries=max_retries)
 
 
 def chat_json(

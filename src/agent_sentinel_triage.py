@@ -25,10 +25,6 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 # RISK TAXONOMY
-# Fixed category definitions used for deterministic embedding-similarity
-# classification. These descriptions are embedded once at agent startup and
-# reused for every change in the run. Adding or editing a category here is
-# the only change needed to extend the taxonomy.
 # =============================================================================
 
 RISK_CATEGORIES: List[Dict[str, Any]] = [
@@ -131,51 +127,34 @@ RISK_CATEGORIES: List[Dict[str, Any]] = [
 
 # =============================================================================
 # RISK BUCKET RULES
-# Maps (base_risk, similarity_score) -> risk_bucket and decision.
-# All thresholds are configurable via ENV so you can tune without code changes.
 # =============================================================================
 
-# Similarity score below which a category match is considered unreliable.
-# Below this threshold the change is classified as "general" regardless of
-# which category had the highest cosine similarity.
 MIN_SIMILARITY_THRESHOLD = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.30"))
-
-# Relevance score (0-1 cosine similarity) thresholds for triage decision.
-# Changes with similarity >= TRIAGE_THRESHOLD go to triage; below -> ignore.
-# This replaces the old LLM-generated relevance_score threshold.
 TRIAGE_THRESHOLD = float(os.getenv("TRIAGE_THRESHOLD", "0.35"))
 
-# Risk bucket boundaries by base_risk level + similarity score.
-# base_risk=high: high bucket if sim >= 0.45, medium if >= 0.35, else low
-# base_risk=medium: high bucket if sim >= 0.55, medium if >= 0.40, else low
-# base_risk=low: always low bucket regardless of similarity
 BUCKET_RULES: Dict[str, List[Tuple[float, str]]] = {
     "high":   [(0.45, "high"), (0.35, "medium"), (0.0, "low")],
     "medium": [(0.55, "high"), (0.40, "medium"), (0.0, "low")],
     "low":    [(0.0, "low")],
 }
 
+# 2048-context safer default for the GCP Gemma endpoint
+SENTINEL_MAX_TOKENS = int(os.getenv("SENTINEL_MAX_TOKENS", "320"))
+
 
 # =============================================================================
 # EMBEDDING CACHE
-# Category descriptions are embedded once per agent run and cached here.
-# This avoids re-embedding the same 8 descriptions for every change.
 # =============================================================================
 
 _CATEGORY_EMBEDDINGS: Optional[List[Tuple[Dict[str, Any], List[float]]]] = None
 
 
 def _get_category_embeddings() -> List[Tuple[Dict[str, Any], List[float]]]:
-    """
-    Embed all risk category descriptions and cache the result.
-    Returns list of (category_dict, embedding_vector) pairs.
-    """
     global _CATEGORY_EMBEDDINGS
     if _CATEGORY_EMBEDDINGS is not None:
         return _CATEGORY_EMBEDDINGS
 
     descriptions = [c["description"] for c in RISK_CATEGORIES]
-    # embed_texts returns normalised embeddings (nomic uses search_document prefix)
     embeddings = embed_texts(descriptions, is_query=False)
 
     _CATEGORY_EMBEDDINGS = list(zip(RISK_CATEGORIES, embeddings))
@@ -185,29 +164,16 @@ def _get_category_embeddings() -> List[Tuple[Dict[str, Any], List[float]]]:
 
 # =============================================================================
 # CLASSIFICATION LOGIC
-# Pure functions - no LLM, fully deterministic given the same embedder.
 # =============================================================================
 
-
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    """
-    Compute cosine similarity between two pre-normalised vectors.
-    embed_texts() with normalize_embeddings=True means dot product == cosine sim.
-    """
     if len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
-    # Clamp to [-1, 1] to handle floating point drift
     return max(-1.0, min(1.0, dot))
 
 
 def _average_embeddings(embeddings: List[List[float]]) -> List[float]:
-    """
-    Average a list of chunk embeddings into a single document-level vector.
-    Since nomic embeddings are already L2-normalised per chunk, averaging
-    gives a reasonable centroid. We re-normalise the result so cosine
-    similarity comparisons remain valid.
-    """
     if not embeddings:
         return []
     dim = len(embeddings[0])
@@ -218,7 +184,6 @@ def _average_embeddings(embeddings: List[List[float]]) -> List[float]:
     n = len(embeddings)
     avg = [v / n for v in avg]
 
-    # Re-normalise
     magnitude = math.sqrt(sum(v * v for v in avg))
     if magnitude > 0:
         avg = [v / magnitude for v in avg]
@@ -226,28 +191,14 @@ def _average_embeddings(embeddings: List[List[float]]) -> List[float]:
 
 
 def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]:
-    """
-    Classify a change using pre-stored vector_chunks embeddings for the
-    snapshot. Averages all chunk embeddings into one document-level vector,
-    then compares cosine similarity against all risk category embeddings.
-
-    Falls back to embedding `fallback_text` directly if no chunks are found
-    in vector_chunks (e.g. snapshot was too short and skipped by embedder,
-    or EMBED_BASELINE_ON_FIRST_SNAPSHOT=false).
-
-    Returns deterministic classification dict - same inputs always produce
-    the same output given the same embedder model.
-    """
     category_embeddings = _get_category_embeddings()
 
-    # ── Get document embedding ────────────────────────────────────────────────
     chunk_embeddings = get_snapshot_embeddings(snapshot_id)
 
     if chunk_embeddings:
         doc_embedding = _average_embeddings(chunk_embeddings)
         embedding_source = f"averaged_{len(chunk_embeddings)}_chunks"
     elif fallback_text:
-        # Re-embed on the fly only as last resort
         logger.warning(
             f"No chunks found for snapshot_id={snapshot_id}, "
             f"falling back to direct embedding."
@@ -267,30 +218,26 @@ def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]
             "embedding_source":      "none",
         }
 
-    # ── Score every category ──────────────────────────────────────────────────
     scores: Dict[str, float] = {}
     for cat, cat_emb in category_embeddings:
         scores[cat["id"]] = _cosine_similarity(doc_embedding, cat_emb)
 
-    best_id    = max(scores, key=lambda k: scores[k])
+    best_id = max(scores, key=lambda k: scores[k])
     best_score = scores[best_id]
-    best_cat   = next(c for c in RISK_CATEGORIES if c["id"] == best_id)
+    best_cat = next(c for c in RISK_CATEGORIES if c["id"] == best_id)
 
-    # Low-confidence fallback
     if best_score < MIN_SIMILARITY_THRESHOLD:
-        best_cat   = next(c for c in RISK_CATEGORIES if c["id"] == "general")
-        best_id    = "general"
+        best_cat = next(c for c in RISK_CATEGORIES if c["id"] == "general")
+        best_id = "general"
         best_score = scores.get("general", best_score)
 
-    # ── Risk bucket ───────────────────────────────────────────────────────────
-    base_risk   = best_cat["base_risk"]
+    base_risk = best_cat["base_risk"]
     risk_bucket = "low"
     for threshold, bucket in BUCKET_RULES[base_risk]:
         if best_score >= threshold:
             risk_bucket = bucket
             break
 
-    # ── Decision ──────────────────────────────────────────────────────────────
     if risk_bucket == "high":
         decision = "triage"
     elif best_score >= TRIAGE_THRESHOLD:
@@ -312,8 +259,6 @@ def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]
 
 # =============================================================================
 # LLM: RATIONALE + SUMMARY ONLY
-# The LLM no longer determines any scores. It only produces human-readable
-# narrative that the Coordinator agent uses for recommendations.
 # =============================================================================
 
 SYSTEM_RATIONALE = """You are the Sentinel Triage Agent, a senior analyst in Android fraud risk and mobile security intelligence.
@@ -342,7 +287,6 @@ OUTPUT RULES:
 
 
 def _detect_source_type(url: str) -> str:
-    """Derive a human-readable source label from the URL for prompt context."""
     u = url.lower()
     if "cisa.gov" in u:
         return "CISA Known Exploited Vulnerabilities (KEV) catalog"
@@ -373,8 +317,6 @@ def build_rationale_prompt(
     source_type = _detect_source_type(url)
     all_scores = classification.get("all_scores", {})
 
-    # Format all category scores for transparency so the LLM understands
-    # the classification context without being able to change it
     scores_str = "  " + "\n  ".join(
         f"{k}: {v}" for k, v in sorted(all_scores.items(), key=lambda x: -x[1])
     ) if all_scores else "  (not available)"
@@ -399,12 +341,8 @@ def build_rationale_prompt(
 
 
 def _parse_rationale_response(raw: Dict[str, Any]) -> Tuple[str, str, List[str], List[str]]:
-    """
-    Extract rationale, insight, affected_signals, and recommended_actions
-    from LLM response dict. Returns (rationale, insight, affected_signals, actions).
-    """
     rationale = str(raw.get("rationale", "No rationale provided."))[:2000]
-    insight   = str(raw.get("insight", ""))[:1000]
+    insight = str(raw.get("insight", ""))[:1000]
 
     affected = raw.get("affected_signals", [])
     if not isinstance(affected, list):
@@ -420,32 +358,29 @@ def _parse_rationale_response(raw: Dict[str, Any]) -> Tuple[str, str, List[str],
 
 
 # =============================================================================
-# SCHEMA (updated to include new deterministic fields)
+# SCHEMA
 # =============================================================================
 
 class SentinelTriageResult(TypedDict):
-    change_id:              int
-    risk_category:          str
-    risk_category_label:    str
-    risk_bucket:            str
-    similarity_score:       float
-    classification_method:  str
-    decision:               str
-    rationale:              str
-    recommended_actions:    List[str]
-    tags:                   List[str]
-    # Legacy fields preserved for coordinator compatibility
-    relevance_score:        int    # mapped from risk_bucket (high=90, medium=60, low=30)
-    local_risk_score:       int    # same mapping
+    change_id: int
+    risk_category: str
+    risk_category_label: str
+    risk_bucket: str
+    similarity_score: float
+    classification_method: str
+    decision: str
+    rationale: str
+    recommended_actions: List[str]
+    tags: List[str]
+    relevance_score: int
+    local_risk_score: int
 
 
 def _bucket_to_score(bucket: str) -> int:
-    """Map risk bucket to legacy int score (0-100) for coordinator compatibility."""
     return {"high": 90, "medium": 60, "low": 30}.get(bucket, 30)
 
 
 def _derive_tags(classification: Dict[str, Any], url: str) -> List[str]:
-    """Derive tags from classification result for filtering/search."""
     tags = [
         classification["risk_category"],
         classification["risk_bucket"],
@@ -464,8 +399,6 @@ def _derive_tags(classification: Dict[str, Any], url: str) -> List[str]:
 
 # =============================================================================
 # BASELINE ENFORCEMENT
-# Baseline changes (first snapshot ever for a source) are always triaged
-# regardless of classification score. This preserves the existing behaviour.
 # =============================================================================
 
 def _is_baseline_init(change: Dict[str, Any]) -> bool:
@@ -488,7 +421,8 @@ def main():
         f"Starting {agent_name} | model={vllm_model} "
         f"| triage_threshold={TRIAGE_THRESHOLD} "
         f"| min_similarity={MIN_SIMILARITY_THRESHOLD} "
-        f"| classification=embedding_similarity"
+        f"| classification=embedding_similarity "
+        f"| sentinel_max_tokens={SENTINEL_MAX_TOKENS}"
     )
 
     try:
@@ -509,7 +443,6 @@ def main():
     }
 
     try:
-        # Pre-compute category embeddings once for the whole run
         _get_category_embeddings()
 
         changes = get_pending_changes_for_triage(limit=25)
@@ -521,8 +454,8 @@ def main():
         for ch in changes:
             change_id = ch.get("id")
             source_id = ch.get("source_id")
-            new_id    = ch.get("new_snapshot_id")
-            prev_id   = ch.get("prev_snapshot_id")
+            new_id = ch.get("new_snapshot_id")
+            prev_id = ch.get("prev_snapshot_id")
 
             if not change_id or not source_id or not new_id:
                 logger.warning(f"Skipping change {change_id}: missing identifiers")
@@ -531,17 +464,15 @@ def main():
 
             baseline = _is_baseline_init(ch)
 
-            # ── Load snapshot texts ───────────────────────────────────────────
             old_text = "" if baseline else get_snapshot_text_by_id(prev_id)
             new_text = get_snapshot_text_by_id(new_id)
-            url      = get_source_url(source_id)
+            url = get_source_url(source_id)
 
             if not new_text:
                 logger.warning(f"Change {change_id}: empty snapshot text, skipping")
                 stats["errors"] += 1
                 continue
 
-            # ── Step 1: Deterministic embedding-similarity classification ─────
             try:
                 classification = classify_change(
                     snapshot_id=new_id,
@@ -560,19 +491,15 @@ def main():
                 f"| decision={classification['decision']}"
             )
 
-            # ── Baseline override: always triage first snapshots ──────────────
             if baseline and classification["decision"] == "ignore":
                 classification["decision"] = "triage"
                 if classification["risk_bucket"] == "low":
                     classification["risk_bucket"] = "medium"
 
             decision = classification["decision"]
-
-            # ── Map to legacy int scores for coordinator compatibility ─────────
             score_int = _bucket_to_score(classification["risk_bucket"])
-            tags      = _derive_tags(classification, url)
+            tags = _derive_tags(classification, url)
 
-            # ── Write deterministic classification fields to DB ───────────────
             update_change_classification_fields(
                 change_id=change_id,
                 risk_category=classification["risk_category"],
@@ -583,7 +510,6 @@ def main():
 
             stats["processed"] += 1
 
-            # ── Ignore path ───────────────────────────────────────────────────
             if decision == "ignore":
                 update_change_triage_fields(
                     change_id=change_id,
@@ -597,9 +523,8 @@ def main():
                 logger.info(f"Change {change_id} IGNORED.")
                 continue
 
-            # ── Triage path: call LLM for rationale only ──────────────────────
-            rationale      = "No rationale generated."
-            insight        = ""
+            rationale = "No rationale generated."
+            insight = ""
             affected_signals: List[str] = []
             rec_actions: List[str] = []
 
@@ -617,7 +542,7 @@ def main():
                     system=SYSTEM_RATIONALE,
                     user=rationale_prompt,
                     temperature=0.1,
-                    max_tokens=700,
+                    max_tokens=SENTINEL_MAX_TOKENS,
                 )
                 rationale, insight, affected_signals, rec_actions = _parse_rationale_response(raw_llm)
                 stats["llm_calls"] += 1
@@ -630,9 +555,7 @@ def main():
                     f"similarity={classification['similarity_score']}). "
                     f"LLM rationale unavailable."
                 )
-                # LLM failure does NOT block triage - classification already done
 
-            # Write triage status
             update_change_triage_fields(
                 change_id=change_id,
                 status="triaged",
@@ -641,25 +564,22 @@ def main():
                 tags=tags,
             )
 
-            # Build summary for coordinator: combine rationale + insight
-            # so coordinator's EVENT SUMMARY field is as rich as possible
             coordinator_summary = rationale
             if insight:
                 coordinator_summary = f"{rationale}\n\nInsight: {insight}"
 
-            # Insert agent event for Coordinator (same schema as before)
             event_payload = {
-                "source_id":    source_id,
-                "snapshot_id":  new_id,
-                "change_id":    change_id,
-                "agent_name":   agent_name,
-                "event_type":   "baseline_init" if baseline else "diff_update",
-                "title":        f"[{classification['risk_bucket'].upper()}] {classification['risk_category_label']}",
-                "summary":      coordinator_summary,
-                "tags":         tags,
-                "relevance_score":   score_int,
-                "local_risk_score":  score_int,
-                "status":       "new",
+                "source_id": source_id,
+                "snapshot_id": new_id,
+                "change_id": change_id,
+                "agent_name": agent_name,
+                "event_type": "baseline_init" if baseline else "diff_update",
+                "title": f"[{classification['risk_bucket'].upper()}] {classification['risk_category_label']}",
+                "summary": coordinator_summary,
+                "tags": tags,
+                "relevance_score": score_int,
+                "local_risk_score": score_int,
+                "status": "new",
             }
 
             event_id = insert_agent_event(event_payload)
@@ -668,8 +588,8 @@ def main():
                 "agent_events", event_id,
                 {
                     **classification,
-                    "rationale":        rationale,
-                    "insight":          insight,
+                    "rationale": rationale,
+                    "insight": insight,
                     "affected_signals": affected_signals,
                     "recommended_actions": rec_actions,
                 },

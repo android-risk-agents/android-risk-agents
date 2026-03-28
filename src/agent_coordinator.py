@@ -1,4 +1,3 @@
-# src/agent_coordinator.py
 import os
 import json
 import re
@@ -40,6 +39,9 @@ SYSTEM_ANALYZE_STRICT = (
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+# 2048-context safer default for Coordinator on the GCP Gemma endpoint
+COORDINATOR_MAX_TOKENS = int(os.getenv("COORDINATOR_MAX_TOKENS", "500"))
 
 
 def _debug_enabled() -> bool:
@@ -250,8 +252,6 @@ def rag_context_from_text(text: str, top_k: int, source_id: Optional[int] = None
     q = t[:1200]
     q_emb = embed_texts([q], is_query=True)[0]
 
-    # Filter to same source so RAG context doesn't cross-contaminate
-    # e.g. a CISA KEV event should not retrieve fingerprint SDK chunks
     filter_sid = str(source_id) if source_id else None
 
     resp = vector_search(
@@ -283,27 +283,20 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
     if not _bool_env("FINGERPRINT_ENABLED", True):
         return False
 
-    # Primary gate: only enrich with fingerprint context when the sentinel
-    # classifier assigned a category where device signals are directly relevant.
-    # CISA KEV, NVD CVEs for non-Android components, policy updates, and
-    # general platform updates do not benefit from fingerprint SDK evidence.
     FINGERPRINT_CATEGORIES = {"device_integrity", "fraud_signal_degradation"}
     risk_category = str(ev.get("risk_category") or "").lower().strip()
 
-    # If risk_category is populated (new sentinel), use it as the sole gate
     if risk_category:
         return risk_category in FINGERPRINT_CATEGORIES
 
-    # Legacy fallback for events created before risk_category field existed:
-    # use the old score + tag + keyword approach
     min_local_risk = _as_int(os.getenv("FINGERPRINT_MIN_LOCAL_RISK", "40"), 40)
-    min_relevance  = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "40"), 40)
+    min_relevance = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "40"), 40)
 
     local_risk = _as_int(ev.get("local_risk_score"), 0)
-    relevance  = _as_int(ev.get("relevance_score"), 0)
-    tags       = _tags(ev)
-    title      = str(ev.get("title") or "").lower()
-    summary    = str(ev.get("summary") or "").lower()
+    relevance = _as_int(ev.get("relevance_score"), 0)
+    tags = _tags(ev)
+    title = str(ev.get("title") or "").lower()
+    summary = str(ev.get("summary") or "").lower()
 
     if local_risk >= min_local_risk:
         return True
@@ -487,7 +480,7 @@ def main() -> int:
             return 0
 
         stats["events_seen"] = len(events)
-        _debug(f"[COORD] pending_events={len(events)}")
+        _debug(f"[COORD] pending_events={len(events)} | coordinator_max_tokens={COORDINATOR_MAX_TOKENS}")
 
         events_sorted = sorted(
             events,
@@ -515,17 +508,11 @@ def main() -> int:
                 snap_text = get_snapshot_text_by_id(snapshot_id) if snapshot_id else ""
                 context = rag_context_from_text(snap_text, top_k=top_k, source_id=source_id)
 
-                # Fetch sentinel classification so risk_category is available for logging
                 if change_id > 0:
                     classification = get_change_classification(change_id)
                     ev["risk_category"] = classification.get("risk_category", "")
-                    ev["risk_bucket"]   = classification.get("risk_bucket", "")
+                    ev["risk_bucket"] = classification.get("risk_bucket", "")
 
-                # Fingerprint retrieval: only for categories where device SDK
-                # signals are directly relevant. CISA KEV, NVD CVEs for
-                # non-device components, policy updates, malware exposure,
-                # and general platform updates do not benefit from fingerprint
-                # SDK evidence and produce irrelevant AndroidIdProvider references.
                 FINGERPRINT_CATEGORIES = {"device_integrity", "fraud_signal_degradation"}
                 risk_category = ev.get("risk_category", "")
                 attempt_fp = risk_category in FINGERPRINT_CATEGORIES
@@ -565,7 +552,7 @@ def main() -> int:
                         system=SYSTEM_ANALYZE,
                         user=prompt,
                         temperature=0.2,
-                        max_tokens=900,
+                        max_tokens=COORDINATOR_MAX_TOKENS,
                     )
                 except Exception:
                     stats["parse_retries"] += 1
@@ -575,7 +562,7 @@ def main() -> int:
                         system=SYSTEM_ANALYZE_STRICT,
                         user=prompt + "\n\nIMPORTANT: Output a single JSON object only.",
                         temperature=0.0,
-                        max_tokens=900,
+                        max_tokens=COORDINATOR_MAX_TOKENS,
                     )
 
                 affected = _as_list_str(out.get("affected_signals"), max_items=6, max_len=140) or []
@@ -587,23 +574,17 @@ def main() -> int:
                 category = out.get("category")
                 category = str(category).strip()[:120] if category else None
 
-                # Derive risk score (1-5) and priority from risk_bucket set by
-                # sentinel classifier rather than the raw local_risk_score int
-                # (which is always 90/60/30 making everything look identical).
                 risk_bucket = ev.get("risk_bucket", "").lower()
                 if risk_bucket == "high":
                     risk_score = 5
-                    priority   = "P0"
+                    priority = "P0"
                 elif risk_bucket == "medium":
                     risk_score = 3
-                    priority   = "P1"
+                    priority = "P1"
                 else:
-                    # low bucket or unknown
                     risk_score = 1
-                    priority   = "P2"
+                    priority = "P2"
 
-                # final_risk kept as 0-100 int for insert_recommendation
-                # which uses it for display, mapped from bucket
                 final_risk = {"high": 85, "medium": 60, "low": 30}.get(risk_bucket, 50)
 
                 final_actions = actions or _default_actions(
