@@ -17,15 +17,11 @@ from src.db import (
     audit_log,
 )
 from src.llm_client import get_llm_client, chat_json
-from src.embedder import embed_texts  # used for category description embeddings only
+from src.embedder import embed_texts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# RISK TAXONOMY
-# =============================================================================
 
 RISK_CATEGORIES: List[Dict[str, Any]] = [
     {
@@ -125,26 +121,17 @@ RISK_CATEGORIES: List[Dict[str, Any]] = [
     },
 ]
 
-# =============================================================================
-# RISK BUCKET RULES
-# =============================================================================
 
 MIN_SIMILARITY_THRESHOLD = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.30"))
 TRIAGE_THRESHOLD = float(os.getenv("TRIAGE_THRESHOLD", "0.35"))
 
 BUCKET_RULES: Dict[str, List[Tuple[float, str]]] = {
-    "high":   [(0.45, "high"), (0.35, "medium"), (0.0, "low")],
+    "high": [(0.45, "high"), (0.35, "medium"), (0.0, "low")],
     "medium": [(0.55, "high"), (0.40, "medium"), (0.0, "low")],
-    "low":    [(0.0, "low")],
+    "low": [(0.0, "low")],
 }
 
-# 2048-context safer default for the GCP Gemma endpoint
-SENTINEL_MAX_TOKENS = int(os.getenv("SENTINEL_MAX_TOKENS", "320"))
-
-
-# =============================================================================
-# EMBEDDING CACHE
-# =============================================================================
+SENTINEL_MAX_TOKENS = int(os.getenv("SENTINEL_MAX_TOKENS", "240"))
 
 _CATEGORY_EMBEDDINGS: Optional[List[Tuple[Dict[str, Any], List[float]]]] = None
 
@@ -161,10 +148,6 @@ def _get_category_embeddings() -> List[Tuple[Dict[str, Any], List[float]]]:
     logger.info(f"Category embeddings computed for {len(_CATEGORY_EMBEDDINGS)} categories.")
     return _CATEGORY_EMBEDDINGS
 
-
-# =============================================================================
-# CLASSIFICATION LOGIC
-# =============================================================================
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if len(a) != len(b):
@@ -192,7 +175,6 @@ def _average_embeddings(embeddings: List[List[float]]) -> List[float]:
 
 def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]:
     category_embeddings = _get_category_embeddings()
-
     chunk_embeddings = get_snapshot_embeddings(snapshot_id)
 
     if chunk_embeddings:
@@ -208,14 +190,14 @@ def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]
     else:
         logger.error(f"No chunks and no fallback text for snapshot_id={snapshot_id}.")
         return {
-            "risk_category":         "general",
-            "risk_category_label":   "General",
-            "risk_bucket":           "low",
-            "similarity_score":      0.0,
+            "risk_category": "general",
+            "risk_category_label": "General",
+            "risk_bucket": "low",
+            "similarity_score": 0.0,
             "classification_method": "embedding_similarity",
-            "decision":              "ignore",
-            "all_scores":            {},
-            "embedding_source":      "none",
+            "decision": "ignore",
+            "all_scores": {},
+            "embedding_source": "none",
         }
 
     scores: Dict[str, float] = {}
@@ -246,41 +228,33 @@ def classify_change(snapshot_id: int, fallback_text: str = "") -> Dict[str, Any]
         decision = "ignore"
 
     return {
-        "risk_category":         best_id,
-        "risk_category_label":   best_cat["label"],
-        "risk_bucket":           risk_bucket,
-        "similarity_score":      round(best_score, 4),
+        "risk_category": best_id,
+        "risk_category_label": best_cat["label"],
+        "risk_bucket": risk_bucket,
+        "similarity_score": round(best_score, 4),
         "classification_method": "embedding_similarity",
-        "decision":              decision,
-        "all_scores":            {k: round(v, 4) for k, v in scores.items()},
-        "embedding_source":      embedding_source,
+        "decision": decision,
+        "all_scores": {k: round(v, 4) for k, v in scores.items()},
+        "embedding_source": embedding_source,
     }
 
 
-# =============================================================================
-# LLM: RATIONALE + SUMMARY ONLY
-# =============================================================================
+SYSTEM_RATIONALE = """You are the Sentinel Triage Agent for Android fraud risk and mobile security intelligence.
 
-SYSTEM_RATIONALE = """You are the Sentinel Triage Agent, a senior analyst in Android fraud risk and mobile security intelligence.
+A deterministic classifier has already assigned the risk category and risk bucket.
+Your job is to return a concise structured JSON summary for the Coordinator Agent.
 
-A deterministic classifier has already assigned a risk category and risk bucket to this event.
-Your only job is to produce a structured JSON summary that will be used by the Coordinator Agent
-to generate recommendations for fraud and security engineering teams.
-
-OUTPUT RULES:
-1. Return ONLY a raw JSON object. No markdown, no code fences, no preamble, no extra text.
-2. Do NOT override or question the risk_category or risk_bucket. They are fixed inputs.
-3. Write as if briefing a fraud analyst or risk engineer who needs to act immediately.
-4. Be specific: name CVE IDs, affected components, Android versions, API names, or policy sections
-   that appear in the content. Do not generalise when specifics are available.
-5. affected_signals must name concrete Android fraud/device signals that this event impacts
-   (e.g. "Android ID", "Play Integrity verdict", "SafetyNet attestation", "kernel version signal",
-   "IMEI access", "advertising ID", "bootloader state"). Leave empty array if none are affected.
-6. Use exactly this JSON schema - no extra fields:
+RULES:
+1. Return ONLY one raw JSON object.
+2. Do NOT override the provided risk_category or risk_bucket.
+3. Ground every claim in the provided content.
+4. Be specific when CVE IDs, Android components, versions, APIs, or policy sections are present.
+5. affected_signals must name concrete Android fraud or device signals when relevant.
+6. Use exactly this schema:
 
 {
-  "rationale": "<4-5 sentences: what changed or was disclosed, which Android components or CVEs are involved, why it matters for fraud risk or device integrity, and what the downstream impact is on risk models or detection signals>",
-  "insight": "<2-3 sentences: the broader security implication beyond this single event - e.g. trend this fits into, attacker capability it enables, or compliance pressure it creates>",
+  "rationale": "<3-4 sentences on what changed, what Android components or issues are involved, why it matters for fraud risk or device integrity, and likely downstream impact>",
+  "insight": "<1-2 sentences on broader implication or trend>",
   "affected_signals": ["<signal 1>", "<signal 2>"],
   "recommended_actions": ["<specific action 1>", "<specific action 2>", "<specific action 3>"]
 }"""
@@ -312,31 +286,22 @@ def build_rationale_prompt(
     baseline: bool,
     change_id: int,
 ) -> str:
-    MAX_CHARS = 4000
-    safe_text = (change_text or "")[:MAX_CHARS]
+    max_chars = int(os.getenv("SENTINEL_CONTENT_MAX_CHARS", "2400"))
+    safe_text = (change_text or "")[:max_chars]
     source_type = _detect_source_type(url)
-    all_scores = classification.get("all_scores", {})
-
-    scores_str = "  " + "\n  ".join(
-        f"{k}: {v}" for k, v in sorted(all_scores.items(), key=lambda x: -x[1])
-    ) if all_scores else "  (not available)"
 
     return (
         f"CHANGE ID: {change_id}\n"
         f"SOURCE TYPE: {source_type}\n"
         f"SOURCE URL: {url}\n"
-        f"ANALYSIS TYPE: {'BASELINE - first time this source has been ingested' if baseline else 'DIFF - content changed since last snapshot'}\n\n"
-        f"DETERMINISTIC CLASSIFICATION RESULTS:\n"
-        f"  Risk Category: {classification['risk_category_label']} ({classification['risk_category']})\n"
-        f"  Risk Bucket: {classification['risk_bucket'].upper()}\n"
-        f"  Similarity Score: {classification['similarity_score']} "
-        f"(cosine similarity to category description embedding)\n"
-        f"  Embedding Source: {classification.get('embedding_source', 'unknown')}\n"
-        f"  All Category Scores:\n{scores_str}\n\n"
-        f"CONTENT (trimmed to {MAX_CHARS} chars):\n"
-        f"{safe_text}\n\n"
-        f"Write the rationale, insight, affected_signals, and recommended_actions JSON for this event.\n"
-        f"Ground every claim in the content above. Do not invent CVEs, component names, or version numbers."
+        f"ANALYSIS TYPE: {'BASELINE' if baseline else 'DIFF'}\n"
+        f"RISK CATEGORY: {classification['risk_category_label']} ({classification['risk_category']})\n"
+        f"RISK BUCKET: {classification['risk_bucket'].upper()}\n"
+        f"SIMILARITY SCORE: {classification['similarity_score']}\n"
+        f"EMBEDDING SOURCE: {classification.get('embedding_source', 'unknown')}\n\n"
+        f"CONTENT:\n{safe_text}\n\n"
+        "Return the JSON fields rationale, insight, affected_signals, and recommended_actions.\n"
+        "Do not invent CVEs, component names, versions, or policy sections."
     )
 
 
@@ -356,10 +321,6 @@ def _parse_rationale_response(raw: Dict[str, Any]) -> Tuple[str, str, List[str],
 
     return rationale, insight, affected, actions
 
-
-# =============================================================================
-# SCHEMA
-# =============================================================================
 
 class SentinelTriageResult(TypedDict):
     change_id: int
@@ -397,10 +358,6 @@ def _derive_tags(classification: Dict[str, Any], url: str) -> List[str]:
     return tags[:8]
 
 
-# =============================================================================
-# BASELINE ENFORCEMENT
-# =============================================================================
-
 def _is_baseline_init(change: Dict[str, Any]) -> bool:
     prev_id = change.get("prev_snapshot_id")
     diff_json = change.get("diff_json", {})
@@ -408,10 +365,6 @@ def _is_baseline_init(change: Dict[str, Any]) -> bool:
         return True
     return prev_id is None
 
-
-# =============================================================================
-# MAIN AGENT LOOP
-# =============================================================================
 
 def main():
     agent_name = os.getenv("AGENT_NAME", "sentinel-triage")
@@ -464,7 +417,6 @@ def main():
 
             baseline = _is_baseline_init(ch)
 
-            old_text = "" if baseline else get_snapshot_text_by_id(prev_id)
             new_text = get_snapshot_text_by_id(new_id)
             url = get_source_url(source_id)
 
@@ -584,8 +536,11 @@ def main():
 
             event_id = insert_agent_event(event_payload)
             audit_log(
-                run_id, agent_name, "triage_event_created",
-                "agent_events", event_id,
+                run_id,
+                agent_name,
+                "triage_event_created",
+                "agent_events",
+                event_id,
                 {
                     **classification,
                     "rationale": rationale,

@@ -40,8 +40,7 @@ SYSTEM_ANALYZE_STRICT = (
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
-# 2048-context safer default for Coordinator on the GCP Gemma endpoint
-COORDINATOR_MAX_TOKENS = int(os.getenv("COORDINATOR_MAX_TOKENS", "500"))
+COORDINATOR_MAX_TOKENS = int(os.getenv("COORDINATOR_MAX_TOKENS", "320"))
 
 
 def _debug_enabled() -> bool:
@@ -181,65 +180,51 @@ def build_deep_insight_prompt(
 ) -> str:
     schema = {
         "title": "string",
-        "summary": "string (3-6 sentences, concrete and actionable, security/risk-model focused)",
+        "summary": "string (3-5 sentences, concrete and actionable, security/risk-model focused)",
         "category": "string (optional)",
         "affected_signals": ["string (up to 6)"],
         "recommended_actions": [
-            "string (actionable steps for risk monitoring / risk models, up to 8; be specific)"
+            "string (actionable steps for risk monitoring / risk models, up to 6; be specific)"
         ],
         "risk_score": "integer 1-5",
         "confidence": "number 0-1",
     }
 
+    context_cap = int(os.getenv("COORD_GENERAL_CONTEXT_MAX_CHARS", "2500"))
+    fp_cap = int(os.getenv("COORD_FP_CONTEXT_MAX_CHARS", "1800"))
+    summary_cap = int(os.getenv("COORD_EVENT_SUMMARY_MAX_CHARS", "700"))
+
     has_fp = bool(fingerprint_context.strip())
 
     fp_section = (
-        f"\nFINGERPRINT TECHNICAL EVIDENCE:\n{fingerprint_context[:5000]}\n"
+        f"\nFINGERPRINT TECHNICAL EVIDENCE:\n{fingerprint_context[:fp_cap]}\n"
         if has_fp
-        else "\nFINGERPRINT TECHNICAL EVIDENCE:\nNone available for this event.\n"
+        else "\nFINGERPRINT TECHNICAL EVIDENCE:\nNone available.\n"
     )
 
     if has_fp:
         grounding_instructions = (
-            "FINGERPRINT EVIDENCE IS AVAILABLE. You MUST ground at least 2 recommended actions "
-            "in the retrieved Fingerprint evidence.\n"
-            "When grounding recommendations, prefer concrete references to retrieved modules, files, "
-            "identifier providers, signal collection logic, fallback behavior, device profiling logic, "
-            "kernel or SDK related signals, security providers, emulator or tamper signals, and integrity checks.\n"
-            "If evidence references AndroidIdProvider, Settings.Secure.getString, versioned signal sets, "
-            "Android version, SDK version, kernel version, encryption status, or security providers, convert "
-            "that into concrete actions such as validation, regression testing, monitoring, fallback review, "
-            "or feature and rule updates.\n"
-            "At least 2 recommended_actions must explicitly mention a retrieved signal, provider, module, "
-            "file, or fallback behavior.\n"
-            "Do not overclaim. If evidence is weak, explicitly recommend engineering validation or targeted monitoring.\n"
+            "Fingerprint evidence is available. Ground at least 2 recommended actions in that evidence. "
+            "Prefer concrete references to retrieved modules, files, providers, signal collection logic, "
+            "fallback behavior, SDK or kernel related signals, security providers, emulator or tamper signals, and integrity checks. "
+            "If evidence is weak, recommend targeted monitoring or engineering validation.\n"
         )
     else:
         grounding_instructions = (
-            "NO FINGERPRINT EVIDENCE IS AVAILABLE FOR THIS EVENT. Ground your recommendations in the "
-            "technical details present in the EVENT SUMMARY and GENERAL CONTEXT instead.\n"
-            "Focus on: specific CVE IDs mentioned, affected Android components or versions, "
-            "patch levels, API changes, policy sections, or vulnerability types present in the content.\n"
-            "Recommended actions should reference concrete details from the content - "
-            "e.g. specific CVE IDs to track, affected components to test, patch levels to validate, "
-            "API behaviors to monitor, or policy requirements to implement.\n"
-            "Do not reference Fingerprint SDK modules or files since none were retrieved.\n"
+            "No Fingerprint evidence is available. Ground recommendations in the event summary and general context. "
+            "Prefer specific CVEs, affected components, versions, patch levels, API changes, or policy sections when present.\n"
         )
 
     return (
         f"SOURCE: {url}\n\n"
         f"EVENT TITLE: {title}\n"
-        f"EVENT SUMMARY: {summary}\n\n"
-        f"GENERAL CONTEXT (RAG snippets):\n{context[:6500]}\n"
+        f"EVENT SUMMARY: {summary[:summary_cap]}\n\n"
+        f"GENERAL CONTEXT:\n{context[:context_cap]}\n"
         f"{fp_section}\n"
-        "Return JSON only. Do not include markdown.\n"
-        "Make recommendations specific to security notes and risk models: "
-        "signals or telemetry to monitor, rules or features to update, tests to add, and what to validate.\n"
+        "Return JSON only.\n"
+        "Make recommendations specific to risk monitoring and risk models: telemetry to monitor, rules or features to update, tests to add, and validations to run.\n"
         f"{grounding_instructions}"
-        "Recommended actions should be operational and specific, not generic. Prefer phrasing like "
-        "'validate identifier fallback behavior', 'monitor null-rate changes in Android ID collection', "
-        "'regression test signal completeness across patch levels', 'track exploitation of CVE-XXXX-XXXXX "
-        "across device fleet', or 'update risk rules to reflect patch level 2026-03-05 enforcement'.\n"
+        "Prefer operational phrasing such as validate fallback behavior, monitor signal null-rate changes, regression test signal completeness, track exploitation of listed CVEs, or update risk rules for patch-level enforcement.\n"
         f"Schema:\n{schema}"
     )
 
@@ -249,7 +234,10 @@ def rag_context_from_text(text: str, top_k: int, source_id: Optional[int] = None
     if not t:
         return ""
 
-    q = t[:1200]
+    query_cap = int(os.getenv("COORD_RAG_QUERY_MAX_CHARS", "700"))
+    chunk_cap = int(os.getenv("COORD_RAG_CHUNK_MAX_CHARS", "500"))
+
+    q = t[:query_cap]
     q_emb = embed_texts([q], is_query=True)[0]
 
     filter_sid = str(source_id) if source_id else None
@@ -266,7 +254,7 @@ def rag_context_from_text(text: str, top_k: int, source_id: Optional[int] = None
     for r in rows[:top_k]:
         chunk = (r.get("chunk_text") or "").strip()
         if chunk:
-            out.append(chunk[:900])
+            out.append(chunk[:chunk_cap])
 
     return "\n\n---\n\n".join(out)
 
@@ -283,11 +271,11 @@ def should_use_fingerprint(ev: Dict[str, Any]) -> bool:
     if not _bool_env("FINGERPRINT_ENABLED", True):
         return False
 
-    FINGERPRINT_CATEGORIES = {"device_integrity", "fraud_signal_degradation"}
+    fingerprint_categories = {"device_integrity", "fraud_signal_degradation"}
     risk_category = str(ev.get("risk_category") or "").lower().strip()
 
     if risk_category:
-        return risk_category in FINGERPRINT_CATEGORIES
+        return risk_category in fingerprint_categories
 
     min_local_risk = _as_int(os.getenv("FINGERPRINT_MIN_LOCAL_RISK", "40"), 40)
     min_relevance = _as_int(os.getenv("FINGERPRINT_MIN_RELEVANCE", "40"), 40)
@@ -376,6 +364,9 @@ def fingerprint_context_from_event(title: str, summary: str, tags: List[str], to
     q_emb = embed_texts([query], is_query=True)[0]
     rows = _fingerprint_vector_search(query_embedding=q_emb, match_count=top_k)
 
+    fp_summary_cap = int(os.getenv("COORD_FP_SUMMARY_MAX_CHARS", "180"))
+    fp_chunk_cap = int(os.getenv("COORD_FP_CHUNK_MAX_CHARS", "350"))
+
     out: List[str] = []
     for idx, r in enumerate(rows[:top_k], start=1):
         chunk = str(r.get("chunk_text") or "").strip()
@@ -418,8 +409,8 @@ def fingerprint_context_from_event(title: str, summary: str, tags: List[str], to
         if chunk_title:
             body_parts.append(f"Title: {chunk_title[:200]}")
         if summary_text:
-            body_parts.append(f"Summary: {summary_text[:350]}")
-        body_parts.append(f"Chunk: {chunk[:900]}")
+            body_parts.append(f"Summary: {summary_text[:fp_summary_cap]}")
+        body_parts.append(f"Chunk: {chunk[:fp_chunk_cap]}")
 
         out.append(section + "\n" + "\n".join(body_parts))
 
@@ -500,7 +491,7 @@ def main() -> int:
             source_id = _as_int(ev.get("source_id"), 0)
 
             title = str(ev.get("title") or "Update detected")[:160]
-            summary = str(ev.get("summary") or "")[:1000]
+            summary = str(ev.get("summary") or "")[:700]
             tags = _tags(ev)
 
             try:
@@ -513,9 +504,9 @@ def main() -> int:
                     ev["risk_category"] = classification.get("risk_category", "")
                     ev["risk_bucket"] = classification.get("risk_bucket", "")
 
-                FINGERPRINT_CATEGORIES = {"device_integrity", "fraud_signal_degradation"}
+                fingerprint_categories = {"device_integrity", "fraud_signal_degradation"}
                 risk_category = ev.get("risk_category", "")
-                attempt_fp = risk_category in FINGERPRINT_CATEGORIES
+                attempt_fp = risk_category in fingerprint_categories
 
                 fingerprint_context = ""
                 fp_used = False

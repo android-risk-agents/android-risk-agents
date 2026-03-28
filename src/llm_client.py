@@ -1,4 +1,3 @@
-# src/llm_client.py
 from __future__ import annotations
 
 import json
@@ -11,10 +10,6 @@ from urllib.parse import urlparse
 
 import requests
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
@@ -26,21 +21,11 @@ def _debug_enabled() -> bool:
 
 
 def _supports_system_role() -> bool:
-    """
-    Some OpenAI-compatible backends reject system role messages.
-    For the GCP vLLM Gemma endpoint, set:
-      LLM_SUPPORTS_SYSTEM_ROLE=false
-    """
     v = str(os.getenv("LLM_SUPPORTS_SYSTEM_ROLE", "true")).strip().lower()
     return v in ("1", "true", "yes", "y")
 
 
 def _safe_url_for_logs(full_url: str) -> str:
-    """
-    GitHub Actions will redact secrets from logs, which can turn URLs into "***".
-    This prints a sanitized host (first 3 + last 3 chars) + full path so you can
-    still verify you're hitting /v1/chat/completions without leaking secrets.
-    """
     try:
         p = urlparse(full_url)
         host = p.hostname or ""
@@ -53,11 +38,6 @@ def _safe_url_for_logs(full_url: str) -> str:
 
 
 def _normalize_model(model: str) -> str:
-    """
-    Allow YAML/env to pass either:
-      - gemma-2-9b-it
-      - google/gemma-2-9b-it
-    """
     m = (model or "").strip()
     if not m:
         return m
@@ -68,12 +48,9 @@ def _normalize_model(model: str) -> str:
     return m
 
 
-# Precompiled regex for speed
 _RE_ILLEGAL_CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
 _RE_MISSING_COMMA_BEFORE_KEY = re.compile(r'(["}\]])\s*(")')
-
-# Safe fixes for common LLM JSON glitches:
 _RE_COMMA_COLON_BEFORE_QUOTE = re.compile(r",\s*:\s*(\")")
 _RE_COMMA_COLON_BEFORE_CLOSE = re.compile(r",\s*:\s*([}\]])")
 _RE_DANGLING_COMMA_COLON_EOF = re.compile(r",\s*:\s*$")
@@ -109,13 +86,13 @@ def _extract_between_markers(
     j = t.rfind(end)
 
     if i != -1 and j != -1 and j > i:
-        return t[i + len(start) : j].strip()
+        return t[i + len(start):j].strip()
 
     if i == -1 and j != -1:
         return t[:j].strip()
 
     if i != -1 and j == -1:
-        return t[i + len(start) :].strip()
+        return t[i + len(start):].strip()
 
     return t
 
@@ -265,31 +242,12 @@ def _extract_first_json_obj(text: str) -> Dict[str, Any]:
 def _extract_content_from_nim_envelope(raw_text: str) -> str:
     cleaned = _remove_illegal_control_chars(raw_text or "")
     data = json.loads(cleaned)
-    content = (
-        (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
-    )
+    content = ((((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or "")
     return content if isinstance(content, str) else ""
-
-
-# -----------------------------
-# Client
-# -----------------------------
 
 
 @dataclass
 class NimClient:
-    """
-    Minimal OpenAI-compatible client for NVIDIA NIM / vLLM style backends.
-
-    base_url may be either:
-      - https://integrate.api.nvidia.com
-      - https://integrate.api.nvidia.com/v1
-      - http://<host>:8000
-      - http://<host>:8000/v1
-
-    We normalize so the final endpoint is always:
-      .../v1/chat/completions
-    """
     base_url: str = "https://integrate.api.nvidia.com/v1"
     timeout_s: int = 60
     max_retries: int = 3
@@ -325,26 +283,25 @@ class NimClient:
         }
 
         model_id = _normalize_model(model)
-
         forced_no_system = not _supports_system_role()
 
-        if forced_no_system:
-            combined = (
-                "INSTRUCTIONS:\n"
-                f"{(system or '').strip()}\n\n"
-                "TASK:\n"
-                f"{(user or '').strip()}\n"
-            )
-            messages = [{"role": "user", "content": combined}]
-        else:
-            messages = [
+        def _build_messages(no_system: bool) -> list[dict[str, str]]:
+            if no_system:
+                combined = (
+                    "INSTRUCTIONS:\n"
+                    f"{(system or '').strip()}\n\n"
+                    "TASK:\n"
+                    f"{(user or '').strip()}\n"
+                )
+                return [{"role": "user", "content": combined}]
+            return [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ]
 
         payload: Dict[str, Any] = {
             "model": model_id,
-            "messages": messages,
+            "messages": _build_messages(forced_no_system),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
@@ -369,16 +326,9 @@ class NimClient:
 
                     last_err = f"HTTP {resp.status_code}: {head}"
 
-                    # Fallback for backends/models that reject "system" role
                     if (not forced_no_system) and ("System role not supported" in head):
                         forced_no_system = True
-                        combined = (
-                            "INSTRUCTIONS:\n"
-                            f"{(system or '').strip()}\n\n"
-                            "TASK:\n"
-                            f"{(user or '').strip()}\n"
-                        )
-                        payload["messages"] = [{"role": "user", "content": combined}]
+                        payload["messages"] = _build_messages(True)
                         payload["temperature"] = 0.0
                         time.sleep(0.4 * attempt)
                         continue
@@ -434,21 +384,10 @@ class NimClient:
                     print(f"[NIM] exception rid={rid}: {last_err[:400]}")
                 time.sleep(0.8 * attempt)
 
-        raise RuntimeError(
-            f"NIM request failed after {self.max_retries} attempts: {last_err}"
-        )
-
-
-# -----------------------------
-# Public interface used by agents
-# -----------------------------
+        raise RuntimeError(f"NIM request failed after {self.max_retries} attempts: {last_err}")
 
 
 def get_llm_client() -> NimClient:
-    """
-    Uses a single configurable base URL:
-      LLM_BASE_URL
-    """
     base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     timeout_s = int(os.getenv("LLM_TIMEOUT_S", "60"))
     max_retries = int(os.getenv("LLM_MAX_RETRIES", "3"))
