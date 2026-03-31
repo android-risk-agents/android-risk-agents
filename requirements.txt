@@ -16,3 +16,8 @@ huggingface_hub>=0.24.0
 einops>=0.7.0
 numpy<2.0.0
 typing-extensions>=4.0.0
+
+# streamlit dashboard
+streamlit
+pandas
+plotly
