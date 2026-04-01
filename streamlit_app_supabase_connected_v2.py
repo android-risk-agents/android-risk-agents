@@ -89,6 +89,13 @@ def normalize_actions(x):
     return [str(x)]
 
 
+def safe_int(x, default=0):
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
 def normalize_risk_score(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
@@ -96,11 +103,13 @@ def normalize_risk_score(x):
         val = float(x)
     except Exception:
         return np.nan
-    # Support either 0-1 or 1-5 style input
+    # 0-1 fractional scale -> multiply to 1-5
     if val <= 1.0:
         val = round(val * 5)
-        val = max(1, min(5, int(val)))
-        return val
+        return int(max(1, min(5, val)))
+    # 0-100 scale (e.g. recommendations.final_risk_score) -> divide to 1-5
+    if val > 5:
+        val = val / 20.0
     return int(max(1, min(5, round(val))))
 
 
@@ -133,6 +142,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         "notes": "",
         "snapshot_id": "snapshot_unknown",
         "source_id": "",
+        "_source_table": "insights",
     }
     out = df.copy()
     for col, default in needed.items():
@@ -175,13 +185,29 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
             "final_risk_score": "risk_score"
         })
 
-        df_recs["title"] = df_recs.get("title", "Recommendation")
-        df_recs["summary"] = df_recs.get("recommendation_text", "")
-        df_recs["component"] = df_recs.get("source_id", "Recommendation Engine")
-        df_recs["kind"] = df_recs.get("category", "recommendation")
+        # Use column existence checks instead of df.get() which doesn't work for assignment
+        if "title" not in df_recs.columns:
+            df_recs["title"] = "Recommendation"
+        if "recommendation_text" in df_recs.columns:
+            df_recs["summary"] = df_recs["recommendation_text"].fillna("")
+        elif "summary" not in df_recs.columns:
+            df_recs["summary"] = ""
+        if "source_id" in df_recs.columns:
+            df_recs["component"] = df_recs["source_id"].astype(str).fillna("Recommendation Engine")
+        elif "component" not in df_recs.columns:
+            df_recs["component"] = "Recommendation Engine"
+        if "category" in df_recs.columns:
+            df_recs["kind"] = df_recs["category"].fillna("recommendation")
+        elif "kind" not in df_recs.columns:
+            df_recs["kind"] = "recommendation"
+        # confidence may not exist in recommendations table - default to 0.7
+        if "confidence" not in df_recs.columns:
+            df_recs["confidence"] = 0.7
         df_recs["confidence"] = df_recs["confidence"].apply(normalize_confidence)
         df_recs["risk_score"] = df_recs["risk_score"].apply(normalize_risk_score)
         df_recs["created_at"] = pd.to_datetime(df_recs["created_at"], errors="coerce")
+        # Tag source table so snapshot filtering can handle it separately
+        df_recs["_source_table"] = "recommendations"
 
     # --- Normalize insights ---
     if not df_insights.empty:
@@ -189,12 +215,18 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
         df_insights["confidence"] = df_insights["confidence"].apply(normalize_confidence)
         df_insights["risk_score"] = df_insights["risk_score"].apply(normalize_risk_score)
         df_insights["created_at"] = pd.to_datetime(df_insights["created_at"], errors="coerce")
+        df_insights["_source_table"] = "insights"
 
     # ---- Combine ----
     df_combined = pd.concat([df_insights, df_recs], ignore_index=True)
 
-    # Clean
-    df_combined = df_combined.dropna(subset=["created_at", "risk_score", "confidence"])
+    # Fill missing scores with defaults instead of dropping rows entirely.
+    # Previously this was dropna(subset=[...]) which silently killed all rows
+    # whose confidence/risk_score came from tables that don't have those columns.
+    df_combined["risk_score"] = df_combined["risk_score"].fillna(0)
+    df_combined["confidence"] = df_combined["confidence"].fillna(0.0)
+    # Only drop rows with no timestamp - those are truly unusable
+    df_combined = df_combined.dropna(subset=["created_at"])
 
     return df_combined
 
@@ -377,22 +409,20 @@ with st.sidebar:
         all_df["snapshot_id"] = "snapshot_unknown"
 
     default_new = snapshots[-1]
-    default_old = snapshots[-2] if len(snapshots) >= 2 else snapshots[0]
 
-    enable_compare = st.toggle("Compare snapshots", value=(len(snapshots) >= 2))
-
-    if enable_compare and len(snapshots) >= 2:
-        snap_new = st.selectbox("New snapshot", snapshots, index=snapshots.index(default_new))
-        snap_old = st.selectbox("Old snapshot", snapshots, index=snapshots.index(default_old))
-    else:
-        snap_new = st.selectbox("Snapshot", snapshots, index=snapshots.index(default_new))
-        snap_old = None
+    # Single snapshot selector - old snapshot compare removed as insights table
+    # doesn't carry historical snapshot_id per row; compare is not meaningful here.
+    snap_new = st.selectbox("Snapshot", snapshots, index=snapshots.index(default_new))
+    snap_old = None
+    enable_compare = False
 
     st.divider()
 
     max_dt = all_df["created_at"].max()
     days = st.number_input("Recent days", min_value=1, max_value=365, value=14, step=1)
-    start_dt = max_dt - timedelta(days=int(days)) if pd.notna(max_dt) else datetime.utcnow() - timedelta(days=14)
+    # Strip timezone for timedelta arithmetic to avoid comparison issues downstream
+    _max_dt_naive = max_dt.replace(tzinfo=None) if pd.notna(max_dt) and hasattr(max_dt, "tzinfo") else max_dt
+    start_dt = _max_dt_naive - timedelta(days=int(days)) if pd.notna(max_dt) else datetime.utcnow() - timedelta(days=14)
 
     min_risk = st.slider("Min risk score", min_value=1, max_value=5, value=3, step=1)
     min_conf = st.slider("Min confidence", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
@@ -414,11 +444,31 @@ with st.sidebar:
     row_limit = st.slider("Max rows in lists", 10, 200, 50, 10)
 
 
-df_new = all_df[all_df["snapshot_id"].astype(str) == str(snap_new)].copy()
-df_old = all_df[all_df["snapshot_id"].astype(str) == str(snap_old)].copy() if snap_old else None
+df_new = all_df.copy()
+
+# Only apply snapshot filtering when there are real distinct snapshot IDs in the data.
+# The insights table does not store snapshot_id directly, so most rows will have
+# snapshot_unknown. When that is the case we skip the snapshot filter entirely so
+# all records are visible.
+_real_snapshots = [s for s in all_df["snapshot_id"].dropna().astype(str).unique()
+                   if s not in ("snapshot_unknown", "", "nan")]
+if _real_snapshots:
+    df_new = all_df[all_df["snapshot_id"].astype(str) == str(snap_new)].copy()
+
+df_old = None
+if snap_old and _real_snapshots:
+    df_old = all_df[all_df["snapshot_id"].astype(str) == str(snap_old)].copy()
 
 df = df_new.copy()
-df = df[df["created_at"] >= pd.to_datetime(start_dt)]
+
+# Supabase timestamps are timezone-aware (UTC). Normalize start_dt to match.
+_start_dt = pd.to_datetime(start_dt)
+if df["created_at"].dt.tz is not None and _start_dt.tzinfo is None:
+    _start_dt = _start_dt.replace(tzinfo=timezone.utc)
+elif df["created_at"].dt.tz is None and _start_dt.tzinfo is not None:
+    _start_dt = _start_dt.replace(tzinfo=None)
+
+df = df[df["created_at"] >= _start_dt]
 df = df[df["risk_score"] >= min_risk]
 df = df[df["confidence"] >= min_conf]
 df = df[df["component"].isin(sel_comps)]
@@ -486,53 +536,46 @@ st.markdown("## 🔎 Executive Risk Summary")
 st.markdown(f"""
 **Current Portfolio Status:** {risk_status}
 
-• Time window: last **{int(days)}** days (from {pd.to_datetime(start_dt).date()} to {pd.to_datetime(max_dt).date() if pd.notna(max_dt) else 'N/A'})  
-• {high_risk_pct}% of filtered insights are high severity (risk ≥4)  
-• Dispersion index (variance): **{risk_variance}**  
-• Recommended focus: **high risk + high confidence**, plus any **changed** items since previous snapshot  
+- Time window: last **{int(days)}** days (from {pd.to_datetime(start_dt).date()} to {pd.to_datetime(max_dt).date() if pd.notna(max_dt) else 'N/A'})
+- {high_risk_pct}% of filtered insights are high severity (risk ≥4)
+- Dispersion index (variance): **{risk_variance}**
 """)
+
+# --- High Priority Updates from recommendations table (rationale + actions) ---
+_rec_df = all_df[all_df["_source_table"] == "recommendations"].copy() if "_source_table" in all_df.columns else pd.DataFrame()
+_high_recs = (
+    _rec_df[_rec_df["risk_score"] >= 4]
+    .sort_values(["risk_score", "confidence"], ascending=[False, False])
+    .head(5)
+    if not _rec_df.empty else pd.DataFrame()
+)
+
+if not _high_recs.empty:
+    st.markdown("### 🚨 High Priority Updates")
+    for _, rec in _high_recs.iterrows():
+        priority_label = rec.get("priority", "")
+        title = rec.get("title", "Untitled")
+        rationale = rec.get("rationale", "")
+        raw_actions = rec.get("recommended_actions", [])
+        actions = normalize_actions(raw_actions)
+        risk = safe_int(rec.get("risk_score", 0))
+        conf = rec.get("confidence", "")
+
+        with st.expander(f"{'🔴' if risk >= 4 else '🟡'} [{priority_label}] {title}  —  Risk {risk} | Conf {conf}", expanded=(risk == 5)):
+            if rationale:
+                st.markdown(f"**Rationale:** {rationale}")
+            if actions:
+                st.markdown("**Recommended Actions:**")
+                for act in actions:
+                    st.markdown(f"- {act}")
+else:
+    st.info("No high-priority recommendations available under current filters.")
 
 st.markdown("---")
 
 diff_added = diff_removed = diff_changed = diff_persisting = None
-if enable_compare and df_old is not None and snap_old != snap_new:
-    df_old_f = df_old.copy()
-    df_old_f = df_old_f[df_old_f["created_at"] >= pd.to_datetime(start_dt)]
-    df_old_f = df_old_f[df_old_f["risk_score"] >= min_risk]
-    df_old_f = df_old_f[df_old_f["confidence"] >= min_conf]
-    df_old_f = df_old_f[df_old_f["component"].isin(sel_comps)]
-    df_old_f = df_old_f[df_old_f["kind"].isin(sel_kinds)]
-    if q.strip():
-        qq = q.strip().lower()
-        df_old_f = df_old_f[df_old_f["title"].astype(str).str.lower().str.contains(qq) | df_old_f["summary"].astype(str).str.lower().str.contains(qq)]
-    if high_only:
-        df_old_f = df_old_f[df_old_f["risk_score"] >= 4]
 
-    diff_added, diff_removed, diff_changed, diff_persisting = compute_diff(df_old_f, df_new)
-    st.subheader("🧭 Change Intelligence (Snapshot Diff)")
-
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Added", len(diff_added))
-    d2.metric("Removed", len(diff_removed))
-    d3.metric("Changed (Modified)", len(diff_changed))
-    d4.metric("Persisting", len(diff_persisting))
-
-    dl1, dl2, dl3 = st.columns(3)
-    with dl1:
-        st.download_button("Download Added CSV", data=df_to_csv_bytes(diff_added) if len(diff_added) else b"", file_name="diff_added.csv", mime="text/csv", disabled=(len(diff_added) == 0))
-    with dl2:
-        st.download_button("Download Changed CSV", data=df_to_csv_bytes(diff_changed) if len(diff_changed) else b"", file_name="diff_changed.csv", mime="text/csv", disabled=(len(diff_changed) == 0))
-    with dl3:
-        st.download_button("Download Removed CSV", data=df_to_csv_bytes(diff_removed) if len(diff_removed) else b"", file_name="diff_removed.csv", mime="text/csv", disabled=(len(diff_removed) == 0))
-
-    if len(diff_changed):
-        show_changed = diff_changed.copy()
-        show_changed["risk_delta"] = show_changed.apply(lambda r: f"{r.get('risk_score')}{badge_delta(r.get('risk_score'), r.get('old_risk_score'), fmt='{:.0f}')}", axis=1)
-        show_changed["conf_delta"] = show_changed.apply(lambda r: f"{r.get('confidence')}{badge_delta(r.get('confidence'), r.get('old_confidence'), fmt='{:.2f}')}", axis=1)
-        st.caption("Changed items preview (risk/conf deltas)")
-        st.dataframe(show_changed[["title", "component", "kind", "risk_delta", "conf_delta", "created_at"]], use_container_width=True)
-
-    st.markdown("---")
+st.markdown("---")
 
 # ----------------------------
 # Charts
@@ -541,9 +584,6 @@ if enable_compare and df_old is not None and snap_old != snap_new:
 # ==========================================================
 # EXECUTIVE OPERATIONAL INTELLIGENCE
 # ==========================================================
-
-import plotly.express as px
-import plotly.graph_objects as go
 
 st.header("Executive Intelligence Overview")
 
@@ -744,3 +784,277 @@ if len(top_risks) == 0:
     st.info("No high-risk items under current filters.")
 else:
     st.dataframe(top_risks[["title", "component", "kind", "risk_score", "confidence", "created_at", "status", "owner", "due_date"]], use_container_width=True)
+
+# ----------------------------
+# RAG : Chatbot (Updated 26.3.29)
+# ----------------------------
+
+st.markdown("## Ask the assistant")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+
+def build_dashboard_evidence(df, top_k=5):
+    if df is None or df.empty:
+        return []
+
+    ranked = (
+        df.copy()
+        .sort_values(["risk_score", "confidence", "created_at"], ascending=[False, False, False])
+        .head(top_k)
+    )
+
+    evidence = []
+    for _, row in ranked.iterrows():
+        chunk_text = (
+            f"Title: {row.get('title', '')}\n"
+            f"Summary: {row.get('summary', '')}\n"
+            f"Risk Score: {row.get('risk_score', '')}\n"
+            f"Confidence: {row.get('confidence', '')}\n"
+            f"Component: {row.get('component', '')}\n"
+            f"Kind: {row.get('kind', '')}\n"
+            f"Category: {row.get('category', '')}\n"
+            f"Created At: {row.get('created_at', '')}\n"
+            f"Status: {row.get('status', '')}\n"
+            f"Owner: {row.get('owner', '')}\n"
+            f"Due Date: {row.get('due_date', '')}\n"
+        )
+
+        evidence.append({
+            "title": row.get("title"),
+            "chunk_text": chunk_text,
+            "source_id": row.get("source_id"),
+            "snapshot_id": row.get("snapshot_id"),
+            "kind": row.get("kind"),
+            "score": float(row.get("confidence", 0.0)) if pd.notna(row.get("confidence")) else None,
+            "risk_score": safe_int(row.get("risk_score"), default=0),
+            "component": row.get("component"),
+            "category": row.get("category"),
+            "created_at": str(row.get("created_at")),
+        })
+
+    return evidence
+
+
+def answer_from_dashboard(question, df, top_k=5):
+    if df is None or df.empty:
+        return {
+            "answer": "There is no filtered dashboard data available to answer this question.",
+            "confidence": 0.0,
+            "evidence": []
+        }
+
+    q = question.strip().lower()
+
+    ranked = (
+        df.copy()
+        .sort_values(["risk_score", "confidence", "created_at"], ascending=[False, False, False])
+        .reset_index(drop=True)
+    )
+
+    evidence = build_dashboard_evidence(df, top_k=top_k)
+
+    # ── Numeric / count questions ──────────────────────────────────────────────
+    import re
+
+    # "how many" total
+    if re.search(r"how many", q):
+        if re.search(r"high.?risk|risk.*(>=?\s*4|score.*[45]|4 or 5)", q) or "high risk" in q:
+            count = int((df["risk_score"] >= 4).sum())
+            return {"answer": f"There are **{count}** high-risk items (risk score ≥ 4) in the current filtered view.", "confidence": 1.0, "evidence": evidence}
+        if re.search(r"total|insight|item|record|row", q):
+            return {"answer": f"There are **{len(df)}** items in the current filtered view.", "confidence": 1.0, "evidence": evidence}
+        # Generic count fallback
+        return {"answer": f"There are **{len(df)}** items in the current filtered view.", "confidence": 1.0, "evidence": evidence}
+
+    # "what is the average / mean risk"
+    if re.search(r"average|mean|avg", q) and re.search(r"risk|score", q):
+        avg = round(df["risk_score"].mean(), 2)
+        return {"answer": f"The average risk score across the **{len(df)}** filtered items is **{avg}**.", "confidence": 1.0, "evidence": evidence}
+
+    # "what is the average confidence"
+    if re.search(r"average|mean|avg", q) and "confidence" in q:
+        avg = round(df["confidence"].mean(), 2)
+        return {"answer": f"The average confidence across the **{len(df)}** filtered items is **{avg}**.", "confidence": 1.0, "evidence": evidence}
+
+    # "max / maximum risk"
+    if re.search(r"max(imum)?|highest", q) and re.search(r"risk score|risk$", q):
+        mx = safe_int(df["risk_score"].max())
+        top_row = ranked.iloc[0]
+        return {
+            "answer": (
+                f"The maximum risk score in the current view is **{mx}**. "
+                f"The item with the highest risk is \"{top_row.get('title', 'Untitled')}\" "
+                f"(confidence {top_row.get('confidence')}, component {top_row.get('component', 'Unknown')})."
+            ),
+            "confidence": 1.0,
+            "evidence": evidence,
+        }
+
+    # "top N" with optional number word
+    _top_n_match = re.search(
+        r"top\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)", q
+    )
+    _word_to_n = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                  "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+    if _top_n_match:
+        raw = _top_n_match.group(1)
+        n = _word_to_n.get(raw, None) or int(raw)
+        top_n = ranked.head(n)
+        lines = []
+        for i, (_, row) in enumerate(top_n.iterrows(), start=1):
+            lines.append(
+                f"{i}. {row.get('title', 'Untitled')} "
+                f"(risk={safe_int(row.get('risk_score'))}, "
+                f"confidence={row.get('confidence')}, "
+                f"component={row.get('component', 'Unknown')})"
+            )
+        return {
+            "answer": f"The top {n} items by risk score currently on the dashboard are:\n\n" + "\n".join(lines),
+            "confidence": 0.95,
+            "evidence": evidence,
+        }
+
+    # ── Category / component breakdown ────────────────────────────────────────
+    if re.search(r"break.?down|by category|by component|per category|per component|distribution", q):
+        col = "category" if "category" in q else "component"
+        breakdown = df.groupby(col)["risk_score"].agg(["count", "mean"]).rename(columns={"count": "items", "mean": "avg_risk"})
+        breakdown["avg_risk"] = breakdown["avg_risk"].round(2)
+        lines = [f"- {idx}: {row['items']} items, avg risk {row['avg_risk']}" for idx, row in breakdown.iterrows()]
+        return {
+            "answer": f"Risk breakdown by **{col}**:\n\n" + "\n".join(lines),
+            "confidence": 0.95,
+            "evidence": evidence,
+        }
+
+    # ── Highest risk ──────────────────────────────────────────────────────────
+    if "highest risk" in q:
+        row = ranked.iloc[0]
+        return {
+            "answer": (
+                f'The highest risk item currently shown is "{row.get("title", "Untitled")}". '
+                f'Risk score: {safe_int(row.get("risk_score"))}, '
+                f'confidence: {row.get("confidence")}, '
+                f'component: {row.get("component", "Unknown")}.'
+            ),
+            "confidence": 0.95,
+            "evidence": evidence,
+        }
+
+    # ── What changed ─────────────────────────────────────────────────────────
+    if "what changed" in q or "changed since" in q or "last snapshot" in q:
+        return {
+            "answer": "Snapshot comparison is disabled. All items are shown from the current snapshot.",
+            "confidence": 0.5,
+            "evidence": evidence,
+        }
+
+    # ── What data am I looking at ─────────────────────────────────────────────
+    if "what data" in q or "what am i looking at" in q or "which data" in q:
+        min_dt = pd.to_datetime(df["created_at"], errors="coerce").min()
+        max_dt_local = pd.to_datetime(df["created_at"], errors="coerce").max()
+        answer = f"You are viewing **{len(df)}** filtered records."
+        if pd.notna(min_dt) and pd.notna(max_dt_local):
+            answer += f" Time range: {min_dt.date()} to {max_dt_local.date()}."
+        top3_titles = ranked.head(3)["title"].fillna("Untitled").tolist()
+        if top3_titles:
+            answer += " Highest-priority titles: " + ", ".join(top3_titles) + "."
+        return {"answer": answer, "confidence": 0.9, "evidence": evidence}
+
+    # ── Action / triage ───────────────────────────────────────────────────────
+    if re.search(r"action|what should|what do i|right now|triage|priorit", q):
+        action_rows = ranked.head(3)
+        lines = []
+        for i, (_, row) in enumerate(action_rows.iterrows(), start=1):
+            actions = normalize_actions(row.get("recommended_actions", []))
+            action_str = actions[0] if actions else "Review and triage"
+            lines.append(
+                f"{i}. **{row.get('title', 'Untitled')}** "
+                f"(risk={safe_int(row.get('risk_score'))}, conf={row.get('confidence')})\n"
+                f"   - Suggested action: {action_str}"
+            )
+        return {
+            "answer": "Top items to triage now:\n\n" + "\n".join(lines),
+            "confidence": 0.9,
+            "evidence": evidence,
+        }
+
+    # ── Rationale for a specific item ─────────────────────────────────────────
+    if "rationale" in q or "why" in q or "reason" in q:
+        # Try to match a title keyword from the question
+        matched = None
+        for _, row in ranked.iterrows():
+            title_words = set(str(row.get("title", "")).lower().split())
+            q_words = set(q.split())
+            if len(title_words & q_words) >= 2:
+                matched = row
+                break
+        if matched is None:
+            matched = ranked.iloc[0]
+        rationale = matched.get("rationale", matched.get("summary", "No rationale available."))
+        return {
+            "answer": f"**{matched.get('title', 'Untitled')}**\n\nRationale: {rationale}",
+            "confidence": 0.85,
+            "evidence": evidence,
+        }
+
+    # ── Generic fallback: show top 5 with stats ───────────────────────────────
+    total = len(df)
+    high = int((df["risk_score"] >= 4).sum())
+    avg = round(df["risk_score"].mean(), 2)
+    top5 = ranked.head(5)
+    lines = []
+    for i, (_, row) in enumerate(top5.iterrows(), start=1):
+        lines.append(
+            f"{i}. {row.get('title', 'Untitled')} "
+            f"(risk={safe_int(row.get('risk_score'))}, conf={row.get('confidence')}, component={row.get('component', '')})"
+        )
+    return {
+        "answer": (
+            f"Current dashboard summary: **{total}** items, **{high}** high-risk (≥4), average risk **{avg}**.\n\n"
+            "Top items by risk:\n\n" + "\n".join(lines)
+        ),
+        "confidence": 0.75,
+        "evidence": evidence,
+    }
+
+
+question = st.text_input("Ask a question about risk insights, changes, or signals")
+
+if st.button("Ask") and question.strip():
+    with st.spinner("Answering from current dashboard data..."):
+        result = answer_from_dashboard(question, df, top_k=5)
+        st.session_state.chat_history.append({
+            "question": question,
+            "result": result,
+        })
+
+for item in reversed(st.session_state.chat_history):
+    st.markdown(f"### Q: {item['question']}")
+    st.write(item["result"]["answer"])
+
+    confidence = item["result"].get("confidence")
+    if confidence is not None:
+        st.caption(f"Confidence: {confidence}")
+
+    with st.expander("Retrieved evidence"):
+        evidence = item["result"].get("evidence", [])
+        if not evidence:
+            st.write("No evidence retrieved.")
+        else:
+            for idx, ev in enumerate(evidence, start=1):
+                st.markdown(f"**Source {idx}: {ev.get('title', 'Untitled')}**")
+                st.write(ev.get("chunk_text", "")[:1000])
+
+                meta = {
+                    "source_id": ev.get("source_id"),
+                    "snapshot_id": ev.get("snapshot_id"),
+                    "kind": ev.get("kind"),
+                    "risk_score": ev.get("risk_score"),
+                    "component": ev.get("component"),
+                    "category": ev.get("category"),
+                    "score": ev.get("score"),
+                    "created_at": ev.get("created_at"),
+                }
+                st.json(meta)
