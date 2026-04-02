@@ -759,7 +759,6 @@ if "chat_history" not in st.session_state:
 @st.cache_resource
 def get_embedder():
     from sentence_transformers import SentenceTransformer
-    # Use the full HuggingFace model ID, not the shorthand
     return SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
 
 
@@ -794,6 +793,33 @@ def safe_similarity(val, default=0.0):
         return default
 
 
+def truncate_at_sentence(text: str, max_chars: int = 500) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[:max_chars]
+    for sep in [". ", "! ", "? "]:
+        last = truncated.rfind(sep)
+        if last != -1:
+            return truncated[:last + 1]
+    last_space = truncated.rfind(" ")
+    if last_space != -1:
+        return truncated[:last_space] + "."
+    return truncated + "."
+
+
+def normalize_actions(actions):
+    if actions is None:
+        return []
+    if isinstance(actions, list):
+        return [str(a).strip() for a in actions if str(a).strip()]
+    if isinstance(actions, str):
+        parts = [p.strip() for p in actions.split("|")]
+        return [p for p in parts if p]
+    return []
+
+
 def build_structured_chunk_text(row: dict) -> str:
     fields = [
         f"Title: {row.get('title', '')}",
@@ -815,14 +841,6 @@ def build_structured_chunk_text(row: dict) -> str:
 
 
 def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
-    """
-    Safely normalize a raw RPC or table row into a standard hit dict.
-    Handles missing fields gracefully - especially for vector RPC results
-    which only return: id, chunk_text, similarity.
-    Fingerprint RPC returns: file_id, repo_name, file_name, file_path,
-    module_name, category, chunk_index, chunk_title, chunk_summary, chunk_text, similarity.
-    """
-    # Title fallback chain per source type
     if source_type == "fingerprint_library_chunks":
         title = (
             row.get("chunk_title")
@@ -831,11 +849,9 @@ def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
             or "Fingerprint Evidence"
         )
     elif source_type == "vector_chunks":
-        # Basic 2-arg RPC returns no title - derive from chunk_text
         raw_chunk = row.get("chunk_text", "") or ""
         title = raw_chunk[:80].replace("\n", " ").strip() or "Knowledge Chunk"
     else:
-        # Structured table rows do have title
         title = (
             row.get("title")
             or row.get("file_name")
@@ -863,11 +879,9 @@ def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
     if isinstance(confidence, float) and pd.isna(confidence):
         confidence = 0.0
 
-    # created_at: NOT returned by vector or fingerprint RPCs - only present on table rows
     raw_created_at = row.get("created_at")
     created_at_str = to_iso_str(raw_created_at) if raw_created_at else ""
 
-    # source_id: not guaranteed from basic 2-arg vector RPC
     source_id = (
         row.get("source_id")
         or row.get("file_id")
@@ -898,22 +912,15 @@ def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
         ),
         "category": row.get("category") or source_type,
         "created_at": created_at_str,
-        "has_created_at": bool(created_at_str),  # flag: only use recency if True
+        "has_created_at": bool(created_at_str),
         "metadata": row,
     }
 
 
 def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
-    """
-    Call a Supabase RPC safely, trying the canonical payload first.
-    For match_vector_chunks, the safest 2-arg call is:
-      {query_embedding, match_count}
-    which returns: id, chunk_text, similarity only.
-    """
     sb = get_supabase()
     payload_options = [
         {"query_embedding": query_embedding, "match_count": match_count},
-        # 4-arg text overload for metadata-enriched results
         {
             "query_embedding": query_embedding,
             "match_count": match_count,
@@ -921,6 +928,7 @@ def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
             "filter_kind": None,
         },
     ]
+
     last_err = None
     for payload in payload_options:
         try:
@@ -931,18 +939,13 @@ def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
         except Exception as e:
             last_err = e
             continue
+
     if last_err:
         raise last_err
     return []
 
 
 def retrieve_vector_chunks(question: str, top_k: int = 5) -> list:
-    """
-    Call match_vector_chunks(query_embedding, match_count).
-    Only parse: id, chunk_text, similarity.
-    All other fields may be absent - handle safely.
-    Source is always Supabase vector_chunks table, never the dashboard df.
-    """
     query_embedding = embed_query(question)
     try:
         rows = vector_rpc_call(VECTOR_RPC_MATCH, query_embedding, top_k)
@@ -960,12 +963,6 @@ def retrieve_vector_chunks(question: str, top_k: int = 5) -> list:
 
 
 def retrieve_fingerprint_chunks(question: str, top_k: int = 4) -> list:
-    """
-    Call match_fingerprint_library_chunks(query_embedding, match_count).
-    Parse: file_id, repo_name, file_name, file_path, module_name, category,
-           chunk_index, chunk_title, chunk_summary, chunk_text, similarity.
-    Title fallback: chunk_title -> file_name -> file_path -> 'Fingerprint Evidence'.
-    """
     if not FINGERPRINT_ENABLED:
         return []
     query_embedding = embed_query(question)
@@ -985,11 +982,6 @@ def retrieve_fingerprint_chunks(question: str, top_k: int = 4) -> list:
 
 
 def retrieve_structured_supabase(question: str, top_k: int = 3) -> list:
-    """
-    Keyword + recency fallback against actual Supabase tables.
-    Tables: insights, recommendations, changes, snapshots.
-    This is pure Supabase - does NOT touch the dashboard dataframe.
-    """
     q = question.lower().strip()
     sb = get_supabase()
     results = []
@@ -1091,6 +1083,7 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
 
     q = question.lower()
     deduped = {}
+
     for hit in results:
         key = (
             f"{hit.get('source_type')}::{hit.get('title')}"
@@ -1101,7 +1094,6 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
         risk = min(max(hit.get("risk_score", 0), 0), 5) / 5.0
         confidence = min(max(hit.get("confidence", 0.0), 0.0), 1.0)
 
-        # Only compute recency if the hit actually has created_at
         recency = 0.0
         if hit.get("has_created_at"):
             try:
@@ -1130,9 +1122,9 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
 
         if query_needs_fingerprint_boost(question) and hit.get("source_type") == "fingerprint_library_chunks":
             source_boost += 0.10
-        if any(
-            term in q for term in ["priority", "triage", "action", "recommendation"]
-        ) and hit.get("source_type") == "recommendations":
+
+        if any(term in q for term in ["priority", "triage", "action", "recommendation"]) \
+           and hit.get("source_type") == "recommendations":
             source_boost += 0.06
 
         final_score = (
@@ -1157,11 +1149,6 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
 
 
 def retrieve_multisource_context(question: str, top_k: int = 8) -> list:
-    """
-    Pure Supabase retrieval - no dashboard dataframe used.
-    Sources: match_vector_chunks RPC, match_fingerprint_library_chunks RPC,
-             and direct table queries (insights, recommendations, changes, snapshots).
-    """
     results = []
     vector_hits = retrieve_vector_chunks(question, top_k=max(4, top_k))
     fingerprint_hits = retrieve_fingerprint_chunks(question, top_k=max(3, top_k // 2))
@@ -1174,8 +1161,151 @@ def retrieve_multisource_context(question: str, top_k: int = 8) -> list:
     return rank_and_dedup_results(results, question, top_k=top_k)
 
 
+def build_evidence_context(evidence: list, max_items: int = 5, max_chars: int = 500) -> str:
+    context_blocks = []
+    for i, ev in enumerate(evidence[:max_items], start=1):
+        title = ev.get("title", "Untitled")
+        source_type = ev.get("source_type", "unknown")
+        risk_score = ev.get("risk_score", 0)
+        confidence = ev.get("confidence", 0.0)
+        excerpt = truncate_at_sentence(ev.get("chunk_text", ""), max_chars=max_chars)
+
+        context_blocks.append(
+            "\n".join([
+                f"Source {i}",
+                f"Title: {title}",
+                f"Source Type: {source_type}",
+                f"Risk Score: {risk_score}",
+                f"Confidence: {confidence}",
+                f"Excerpt: {excerpt}",
+            ])
+        )
+    return "\n\n".join(context_blocks)
+
+
+def classify_question_type(question: str) -> str:
+    q = question.lower().strip()
+
+    if any(phrase in q for phrase in ["how many", "count", "number of"]):
+        return "count"
+    if any(phrase in q for phrase in ["what changed", "new changes", "recent changes", "since the last update"]):
+        return "changes"
+    if any(phrase in q for phrase in ["what should i do", "action item", "what next", "next step"]):
+        return "action"
+    if any(phrase in q for phrase in ["why is this a risk", "why does this matter"]):
+        return "why"
+    if any(term in q for term in ["top", "highest", "priority", "triage", "most important risks"]):
+        return "top_risks"
+
+    return "general"
+
+
+# ---------------------------------------
+# LLM call
+# ---------------------------------------
+from src.llm_client import get_llm_client, chat_json
+
+def call_llm(prompt: str) -> str:
+    client = get_llm_client()
+
+    result = chat_json(
+        client=client,
+        model="gemma-2-9b-it",
+        system=(
+            "You are a security risk analyst. "
+            "Return valid JSON with a single key: answer."
+        ),
+        user=(
+            "Answer the user's question using the provided context. "
+            "Be concise, natural, and human-readable.\n\n"
+            f"{prompt}\n\n"
+            'Return JSON only, like: {"answer": "..."}'
+        ),
+        temperature=0.3,
+        max_tokens=400,
+    )
+
+    return (result.get("answer") or "").strip()
+
+def generate_natural_answer(question: str, evidence: list) -> str:
+    question_type = classify_question_type(question)
+    context = build_evidence_context(evidence, max_items=5, max_chars=500)
+    
+    prompt = f"""
+You are a sharp security risk analyst.
+
+Question type: {question_type}
+User question: "{question}"
+
+Retrieved context:
+{context}
+
+Write a clear and decisive answer.
+
+Rules:
+- Start with a strong, direct statement (avoid vague phrases like "this focuses on")
+- Only include information that directly answers the question
+- Do NOT introduce unrelated topics
+- Emphasize impact and risk (why this matters)
+- Avoid generic phrases like "monitor closely" unless you explain why
+- Be concise and specific
+
+Structure:
+1. First sentence: clear answer
+2. 1–2 sentences: why it matters (impact)
+3. Final sentence: "Bottom line: ..."
+
+Do not list items unless necessary.
+"""
+
+    return call_llm(prompt).strip()
+
+
+def count_from_supabase(question: str) -> dict:
+    sb = get_supabase()
+    q = question.lower().strip()
+    count_results = {}
+
+    table_keyword_map = {
+        "recommendations": ["recommendation", "action item", "action"],
+        "insights": ["insight", "finding"],
+        "changes": ["change", "diff"],
+        "snapshots": ["snapshot"],
+    }
+
+    tables_to_count = []
+    for table, keywords in table_keyword_map.items():
+        if any(kw in q for kw in keywords):
+            tables_to_count.append(table)
+
+    if not tables_to_count:
+        tables_to_count = list(table_keyword_map.keys())
+
+    for table in tables_to_count:
+        try:
+            resp = sb.table(table).select("id", count="exact").execute()
+            count_results[table] = resp.count if resp.count is not None else len(resp.data or [])
+        except Exception:
+            count_results[table] = "unavailable"
+
+    parts = [f"- {k}: **{v}**" for k, v in count_results.items()]
+    total = sum(v for v in count_results.values() if isinstance(v, int))
+
+    answer = (
+        "Exact counts from Supabase:\n\n"
+        + "\n".join(parts)
+        + f"\n\n**Total: {total}**"
+    )
+
+    return {
+        "answer": answer,
+        "confidence": 0.95,
+    }
+
+
 def answer_from_supabase_rag(question: str, top_k: int = 8) -> dict:
     evidence = retrieve_multisource_context(question, top_k=top_k)
+
     if not evidence:
         return {
             "answer": "I could not retrieve any relevant evidence from Supabase for this question.",
@@ -1183,90 +1313,27 @@ def answer_from_supabase_rag(question: str, top_k: int = 8) -> dict:
             "evidence": [],
         }
 
-    q = question.lower().strip()
+    question_type = classify_question_type(question)
 
-    if any(phrase in q for phrase in ["how many", "count", "number of"]):
-        sb = get_supabase()
-        count_results = {}
-
-        table_keyword_map = {
-            "recommendations": ["recommendation", "action item", "action"],
-            "insights": ["insight", "finding"],
-            "changes": ["change", "diff"],
-            "snapshots": ["snapshot"],
-        }
-
-        tables_to_count = []
-        for table, keywords in table_keyword_map.items():
-            if any(kw in q for kw in keywords):
-                tables_to_count.append(table)
-
-        if not tables_to_count:
-            tables_to_count = list(table_keyword_map.keys())
-
-        for table in tables_to_count:
-            try:
-                resp = sb.table(table).select("id", count="exact").execute()
-                count_results[table] = resp.count if resp.count is not None else len(resp.data or [])
-            except Exception:
-                count_results[table] = "unavailable"
-
-        parts = [f"{k}: **{v}**" for k, v in count_results.items()]
-        total = sum(v for v in count_results.values() if isinstance(v, int))
-        answer = (
-            f"Exact counts from Supabase:\n\n"
-            + "\n".join(f"- {p}" for p in parts)
-            + f"\n\n**Total: {total}**"
-        )
-        return {"answer": answer, "confidence": 0.95, "evidence": evidence}
-
-    if any(term in q for term in ["top", "highest", "priority", "triage", "action"]):
-        lines = []
-        for i, ev in enumerate(evidence[:5], start=1):
-            lines.append(
-                f"{i}. **{ev.get('title', 'Untitled')}** "
-                f"[{ev.get('source_type')}] - risk {ev.get('risk_score', 0)}, "
-                f"score {round(ev.get('final_rank_score', 0.0), 2)}"
-            )
+    if question_type == "count":
+        count_result = count_from_supabase(question)
         return {
-            "answer": "Top relevant Supabase-backed evidence:\n\n" + "\n".join(lines),
-            "confidence": round(
-                min(0.95, max(0.55, evidence[0].get("final_rank_score", 0.0))), 2
-            ),
+            "answer": count_result["answer"],
+            "confidence": count_result["confidence"],
             "evidence": evidence,
         }
 
-    top = evidence[0]
-
-    # Build a proper sentence-boundary truncation
-    def truncate_at_sentence(text: str, max_chars: int = 400) -> str:
-        text = (text or "").replace("\n", " ").strip()
-        if len(text) <= max_chars:
-            return text
-        # Try to cut at last sentence boundary before max_chars
-        truncated = text[:max_chars]
-        for sep in [". ", "! ", "? "]:
-            last = truncated.rfind(sep)
-            if last != -1:
-                return truncated[:last + 1]
-        # No sentence boundary found - cut at last word boundary
-        last_space = truncated.rfind(" ")
-        if last_space != -1:
-            return truncated[:last_space] + "."
-        return truncated + "."
-
-    support_lines = []
-    for i, ev in enumerate(evidence[:4], start=1):
-        excerpt = truncate_at_sentence(ev.get("chunk_text", ""), max_chars=600)
-        support_lines.append(
-            f"{i}. **[{ev.get('source_type')}] {ev.get('title', 'Untitled')}**\n   {excerpt}"
+    try:
+        answer = generate_natural_answer(question, evidence)
+    except Exception as e:
+        top = evidence[0]
+        fallback_excerpt = truncate_at_sentence(top.get("chunk_text", ""), max_chars=500)
+        answer = (
+            f"The most relevant item right now is **{top.get('title', 'Untitled')}**.\n\n"
+            f"{fallback_excerpt}\n\n"
+            f"Bottom line: this appears to be the strongest match for your question, "
+            f"but the natural-language summary step failed with: {e}"
         )
-
-    answer = (
-        f"Based on Supabase retrieval, the strongest match is **{top.get('title', 'Untitled')}** "
-        f"from **{top.get('source_type')}**.\n\n"
-        f"**Supporting evidence:**\n\n" + "\n\n".join(support_lines)
-    )
 
     conf = round(min(0.95, max(0.40, evidence[0].get("final_rank_score", 0.0))), 2)
 
