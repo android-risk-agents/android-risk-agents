@@ -28,6 +28,16 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANO
 INSIGHTS_TABLE = os.getenv("INSIGHTS_TABLE", "insights")
 DEFAULT_FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "500"))
 
+# ---- RAG / embedding env ----
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+VECTOR_RPC_MATCH = os.getenv("VECTOR_RPC_MATCH", "match_vector_chunks")
+VECTOR_TABLE = os.getenv("VECTOR_TABLE", "vector_chunks")
+FINGERPRINT_VECTOR_RPC = os.getenv("FINGERPRINT_VECTOR_RPC", "match_fingerprint_library_chunks")
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+RAG_STRUCTURED_TOP_K = int(os.getenv("RAG_STRUCTURED_TOP_K", "3"))
+MIN_SIMILARITY_THRESHOLD = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.30"))
+FINGERPRINT_ENABLED = os.getenv("FINGERPRINT_ENABLED", "true").lower() == "true"
+
 
 @st.cache_resource
 def get_supabase():
@@ -103,11 +113,9 @@ def normalize_risk_score(x):
         val = float(x)
     except Exception:
         return np.nan
-    # 0-1 fractional scale -> multiply to 1-5
     if val <= 1.0:
         val = round(val * 5)
         return int(max(1, min(5, val)))
-    # 0-100 scale (e.g. recommendations.final_risk_score) -> divide to 1-5
     if val > 5:
         val = val / 20.0
     return int(max(1, min(5, round(val))))
@@ -155,7 +163,6 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFrame:
     sb = get_supabase()
 
-    # ---- Pull INSIGHTS table ----
     insights_rows = (
         sb.table("insights")
         .select("*")
@@ -167,7 +174,6 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
 
     df_insights = pd.DataFrame(insights_rows or [])
 
-    # ---- Pull RECOMMENDATIONS table ----
     rec_rows = (
         sb.table("recommendations")
         .select("*")
@@ -179,13 +185,11 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
 
     df_recs = pd.DataFrame(rec_rows or [])
 
-    # --- Normalize recommendations table ---
     if not df_recs.empty:
         df_recs = df_recs.rename(columns={
             "final_risk_score": "risk_score"
         })
 
-        # Use column existence checks instead of df.get() which doesn't work for assignment
         if "title" not in df_recs.columns:
             df_recs["title"] = "Recommendation"
         if "recommendation_text" in df_recs.columns:
@@ -200,16 +204,13 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
             df_recs["kind"] = df_recs["category"].fillna("recommendation")
         elif "kind" not in df_recs.columns:
             df_recs["kind"] = "recommendation"
-        # confidence may not exist in recommendations table - default to 0.7
         if "confidence" not in df_recs.columns:
             df_recs["confidence"] = 0.7
         df_recs["confidence"] = df_recs["confidence"].apply(normalize_confidence)
         df_recs["risk_score"] = df_recs["risk_score"].apply(normalize_risk_score)
         df_recs["created_at"] = pd.to_datetime(df_recs["created_at"], errors="coerce")
-        # Tag source table so snapshot filtering can handle it separately
         df_recs["_source_table"] = "recommendations"
 
-    # --- Normalize insights ---
     if not df_insights.empty:
         df_insights = ensure_columns(df_insights)
         df_insights["confidence"] = df_insights["confidence"].apply(normalize_confidence)
@@ -217,18 +218,13 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
         df_insights["created_at"] = pd.to_datetime(df_insights["created_at"], errors="coerce")
         df_insights["_source_table"] = "insights"
 
-    # ---- Combine ----
     df_combined = pd.concat([df_insights, df_recs], ignore_index=True)
-
-    # Fill missing scores with defaults instead of dropping rows entirely.
-    # Previously this was dropna(subset=[...]) which silently killed all rows
-    # whose confidence/risk_score came from tables that don't have those columns.
     df_combined["risk_score"] = df_combined["risk_score"].fillna(0)
     df_combined["confidence"] = df_combined["confidence"].fillna(0.0)
-    # Only drop rows with no timestamp - those are truly unusable
     df_combined = df_combined.dropna(subset=["created_at"])
 
     return df_combined
+
 
 def make_mock_data():
     n = 22
@@ -376,8 +372,6 @@ with st.sidebar:
 load_error = None
 try:
     all_df = fetch_insights_from_supabase(DEFAULT_FETCH_LIMIT)
-   # st.write("DEBUG — All rows loaded:", len(all_df))
-#st.write(all_df.head())
     data_mode = "Supabase"
     if all_df.empty:
         raise RuntimeError(f"No rows found in table '{INSIGHTS_TABLE}'.")
@@ -410,8 +404,6 @@ with st.sidebar:
 
     default_new = snapshots[-1]
 
-    # Single snapshot selector - old snapshot compare removed as insights table
-    # doesn't carry historical snapshot_id per row; compare is not meaningful here.
     snap_new = st.selectbox("Snapshot", snapshots, index=snapshots.index(default_new))
     snap_old = None
     enable_compare = False
@@ -420,7 +412,6 @@ with st.sidebar:
 
     max_dt = all_df["created_at"].max()
     days = st.number_input("Recent days", min_value=1, max_value=365, value=14, step=1)
-    # Strip timezone for timedelta arithmetic to avoid comparison issues downstream
     _max_dt_naive = max_dt.replace(tzinfo=None) if pd.notna(max_dt) and hasattr(max_dt, "tzinfo") else max_dt
     start_dt = _max_dt_naive - timedelta(days=int(days)) if pd.notna(max_dt) else datetime.utcnow() - timedelta(days=14)
 
@@ -446,10 +437,6 @@ with st.sidebar:
 
 df_new = all_df.copy()
 
-# Only apply snapshot filtering when there are real distinct snapshot IDs in the data.
-# The insights table does not store snapshot_id directly, so most rows will have
-# snapshot_unknown. When that is the case we skip the snapshot filter entirely so
-# all records are visible.
 _real_snapshots = [s for s in all_df["snapshot_id"].dropna().astype(str).unique()
                    if s not in ("snapshot_unknown", "", "nan")]
 if _real_snapshots:
@@ -461,7 +448,6 @@ if snap_old and _real_snapshots:
 
 df = df_new.copy()
 
-# Supabase timestamps are timezone-aware (UTC). Normalize start_dt to match.
 _start_dt = pd.to_datetime(start_dt)
 if df["created_at"].dt.tz is not None and _start_dt.tzinfo is None:
     _start_dt = _start_dt.replace(tzinfo=timezone.utc)
@@ -541,7 +527,6 @@ st.markdown(f"""
 - Dispersion index (variance): **{risk_variance}**
 """)
 
-# --- High Priority Updates from recommendations table (rationale + actions) ---
 _rec_df = all_df[all_df["_source_table"] == "recommendations"].copy() if "_source_table" in all_df.columns else pd.DataFrame()
 _high_recs = (
     _rec_df[_rec_df["risk_score"] >= 4]
@@ -580,26 +565,15 @@ st.markdown("---")
 # ----------------------------
 # Charts
 # ----------------------------
-# ----------------------------
-# ==========================================================
-# EXECUTIVE OPERATIONAL INTELLIGENCE
-# ==========================================================
-
 st.header("Executive Intelligence Overview")
 
 df_exec = all_df.copy()
 df_exec = df_exec[df_exec["risk_score"] > 0]
 
-# Ensure numeric
 df_exec["risk_score"] = pd.to_numeric(df_exec["risk_score"], errors="coerce")
 df_exec["confidence"] = pd.to_numeric(df_exec["confidence"], errors="coerce")
 
 df_exec["weighted_risk"] = df_exec["risk_score"] * df_exec["confidence"]
-
-
-# ==========================================================
-# 1️⃣ CONFIDENCE-WEIGHTED RISK EXPOSURE
-# ==========================================================
 
 st.subheader("1️⃣ Confidence-Weighted Risk Exposure")
 
@@ -624,10 +598,6 @@ fig_weighted = px.bar(
 )
 
 st.plotly_chart(fig_weighted, use_container_width=True)
-
-# ==========================================================
-# 2️⃣ RISK–CONFIDENCE PRIORITY QUADRANT
-# ==========================================================
 
 st.subheader("2️⃣ Risk–Confidence Priority Quadrant")
 
@@ -665,11 +635,6 @@ fig_quad.update_layout(
 
 st.plotly_chart(fig_quad, use_container_width=True)
 
-
-# ==========================================================
-# 3️⃣ CUMULATIVE RISK EXPOSURE CURVE
-# ==========================================================
-
 st.subheader("3️⃣ Cumulative Risk Exposure Curve")
 
 sorted_df = df_exec.sort_values("weighted_risk", ascending=False).reset_index(drop=True)
@@ -690,10 +655,6 @@ fig_curve.update_layout(
 
 st.plotly_chart(fig_curve, use_container_width=True)
 
-# ==========================================================
-# 4️⃣ CATEGORY RISK CONCENTRATION
-# ==========================================================
-
 st.subheader("4️⃣ Risk Concentration by Category")
 
 category_risk = (
@@ -711,6 +672,7 @@ fig_cat = px.bar(
 )
 
 st.plotly_chart(fig_cat, use_container_width=True)
+
 # ----------------------------
 # Triage queue + detail panel
 # ----------------------------
@@ -786,236 +748,531 @@ else:
     st.dataframe(top_risks[["title", "component", "kind", "risk_score", "confidence", "created_at", "status", "owner", "due_date"]], use_container_width=True)
 
 # ----------------------------
-# RAG : Chatbot (Updated 26.3.29)
+# RAG : Chatbot (Supabase-only, vector search)
 # ----------------------------
-
 st.markdown("## Ask the assistant")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 
-def build_dashboard_evidence(df, top_k=5):
-    if df is None or df.empty:
+@st.cache_resource
+def get_embedder():
+    from sentence_transformers import SentenceTransformer
+    # Use the full HuggingFace model ID, not the shorthand
+    return SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+
+
+def embed_query(text: str):
+    model = get_embedder()
+    try:
+        vec = model.encode([text], normalize_embeddings=True, prompt_name="query")[0]
+    except TypeError:
+        try:
+            vec = model.encode([text], normalize_embeddings=True)[0]
+        except Exception:
+            vec = model.encode([f"search_query: {text}"], normalize_embeddings=True)[0]
+    except Exception:
+        vec = model.encode([f"search_query: {text}"], normalize_embeddings=True)[0]
+    return vec.tolist()
+
+
+def to_iso_str(x):
+    try:
+        ts = pd.to_datetime(x, errors="coerce")
+        if pd.isna(ts):
+            return ""
+        return str(ts)
+    except Exception:
+        return str(x or "")
+
+
+def safe_similarity(val, default=0.0):
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def build_structured_chunk_text(row: dict) -> str:
+    fields = [
+        f"Title: {row.get('title', '')}",
+        f"Summary: {row.get('summary', '')}",
+        f"Recommendation: {row.get('recommendation_text', '')}",
+        f"Rationale: {row.get('rationale', '')}",
+        f"Risk Score: {row.get('risk_score', row.get('final_risk_score', ''))}",
+        f"Confidence: {row.get('confidence', '')}",
+        f"Priority: {row.get('priority', '')}",
+        f"Category: {row.get('category', '')}",
+        f"Component: {row.get('component', row.get('source_id', ''))}",
+        f"Kind: {row.get('kind', '')}",
+        f"Created At: {row.get('created_at', '')}",
+    ]
+    actions = normalize_actions(row.get("recommended_actions"))
+    if actions:
+        fields.append("Recommended Actions: " + " | ".join(actions))
+    return "\n".join(fields)
+
+
+def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
+    """
+    Safely normalize a raw RPC or table row into a standard hit dict.
+    Handles missing fields gracefully - especially for vector RPC results
+    which only return: id, chunk_text, similarity.
+    Fingerprint RPC returns: file_id, repo_name, file_name, file_path,
+    module_name, category, chunk_index, chunk_title, chunk_summary, chunk_text, similarity.
+    """
+    # Title fallback chain per source type
+    if source_type == "fingerprint_library_chunks":
+        title = (
+            row.get("chunk_title")
+            or row.get("file_name")
+            or row.get("file_path")
+            or "Fingerprint Evidence"
+        )
+    elif source_type == "vector_chunks":
+        # Basic 2-arg RPC returns no title - derive from chunk_text
+        raw_chunk = row.get("chunk_text", "") or ""
+        title = raw_chunk[:80].replace("\n", " ").strip() or "Knowledge Chunk"
+    else:
+        # Structured table rows do have title
+        title = (
+            row.get("title")
+            or row.get("file_name")
+            or row.get("name")
+            or source_type
+        )
+
+    chunk_text = (
+        row.get("chunk_text")
+        or row.get("chunk_summary")
+        or row.get("summary")
+        or row.get("recommendation_text")
+        or row.get("content")
+        or row.get("text")
+        or build_structured_chunk_text(row)
+    )
+
+    risk_score = normalize_risk_score(
+        row.get("risk_score", row.get("final_risk_score"))
+    )
+    if pd.isna(risk_score) if isinstance(risk_score, float) else False:
+        risk_score = 0
+
+    confidence = normalize_confidence(row.get("confidence"))
+    if isinstance(confidence, float) and pd.isna(confidence):
+        confidence = 0.0
+
+    # created_at: NOT returned by vector or fingerprint RPCs - only present on table rows
+    raw_created_at = row.get("created_at")
+    created_at_str = to_iso_str(raw_created_at) if raw_created_at else ""
+
+    # source_id: not guaranteed from basic 2-arg vector RPC
+    source_id = (
+        row.get("source_id")
+        or row.get("file_id")
+        or row.get("id")
+        or ""
+    )
+
+    return {
+        "source_type": source_type,
+        "title": title,
+        "chunk_text": str(chunk_text or ""),
+        "score": safe_similarity(
+            similarity if similarity is not None
+            else row.get("similarity", row.get("score", 0.0))
+        ),
+        "risk_score": safe_int(risk_score, default=0),
+        "confidence": float(confidence) if confidence else 0.0,
+        "source_id": str(source_id),
+        "snapshot_id": row.get("snapshot_id", ""),
+        "kind": row.get("kind") or row.get("category") or source_type,
+        "component": (
+            row.get("component")
+            or row.get("module_name")
+            or row.get("repo_name")
+            or row.get("source_id")
+            or row.get("file_name")
+            or ""
+        ),
+        "category": row.get("category") or source_type,
+        "created_at": created_at_str,
+        "has_created_at": bool(created_at_str),  # flag: only use recency if True
+        "metadata": row,
+    }
+
+
+def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
+    """
+    Call a Supabase RPC safely, trying the canonical payload first.
+    For match_vector_chunks, the safest 2-arg call is:
+      {query_embedding, match_count}
+    which returns: id, chunk_text, similarity only.
+    """
+    sb = get_supabase()
+    payload_options = [
+        {"query_embedding": query_embedding, "match_count": match_count},
+        # 4-arg text overload for metadata-enriched results
+        {
+            "query_embedding": query_embedding,
+            "match_count": match_count,
+            "filter_source_id": None,
+            "filter_kind": None,
+        },
+    ]
+    last_err = None
+    for payload in payload_options:
+        try:
+            resp = sb.rpc(rpc_name, payload).execute()
+            data = getattr(resp, "data", None) or []
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return []
+
+
+def retrieve_vector_chunks(question: str, top_k: int = 5) -> list:
+    """
+    Call match_vector_chunks(query_embedding, match_count).
+    Only parse: id, chunk_text, similarity.
+    All other fields may be absent - handle safely.
+    Source is always Supabase vector_chunks table, never the dashboard df.
+    """
+    query_embedding = embed_query(question)
+    try:
+        rows = vector_rpc_call(VECTOR_RPC_MATCH, query_embedding, top_k)
+    except Exception as e:
+        st.warning(f"Vector RPC failed: {e}")
         return []
 
-    ranked = (
-        df.copy()
-        .sort_values(["risk_score", "confidence", "created_at"], ascending=[False, False, False])
-        .head(top_k)
-    )
+    hits = []
+    for r in rows:
+        sim_score = safe_similarity(r.get("similarity", r.get("score", 0.0)))
+        if sim_score < MIN_SIMILARITY_THRESHOLD:
+            continue
+        hits.append(normalize_hit("vector_chunks", r, similarity=sim_score))
+    return hits
 
-    evidence = []
-    for _, row in ranked.iterrows():
-        chunk_text = (
-            f"Title: {row.get('title', '')}\n"
-            f"Summary: {row.get('summary', '')}\n"
-            f"Risk Score: {row.get('risk_score', '')}\n"
-            f"Confidence: {row.get('confidence', '')}\n"
-            f"Component: {row.get('component', '')}\n"
-            f"Kind: {row.get('kind', '')}\n"
-            f"Category: {row.get('category', '')}\n"
-            f"Created At: {row.get('created_at', '')}\n"
-            f"Status: {row.get('status', '')}\n"
-            f"Owner: {row.get('owner', '')}\n"
-            f"Due Date: {row.get('due_date', '')}\n"
+
+def retrieve_fingerprint_chunks(question: str, top_k: int = 4) -> list:
+    """
+    Call match_fingerprint_library_chunks(query_embedding, match_count).
+    Parse: file_id, repo_name, file_name, file_path, module_name, category,
+           chunk_index, chunk_title, chunk_summary, chunk_text, similarity.
+    Title fallback: chunk_title -> file_name -> file_path -> 'Fingerprint Evidence'.
+    """
+    if not FINGERPRINT_ENABLED:
+        return []
+    query_embedding = embed_query(question)
+    try:
+        rows = vector_rpc_call(FINGERPRINT_VECTOR_RPC, query_embedding, top_k)
+    except Exception as e:
+        st.warning(f"Fingerprint RPC failed: {e}")
+        return []
+
+    hits = []
+    for r in rows:
+        sim_score = safe_similarity(r.get("similarity", r.get("score", 0.0)))
+        if sim_score < MIN_SIMILARITY_THRESHOLD:
+            continue
+        hits.append(normalize_hit("fingerprint_library_chunks", r, similarity=sim_score))
+    return hits
+
+
+def retrieve_structured_supabase(question: str, top_k: int = 3) -> list:
+    """
+    Keyword + recency fallback against actual Supabase tables.
+    Tables: insights, recommendations, changes, snapshots.
+    This is pure Supabase - does NOT touch the dashboard dataframe.
+    """
+    q = question.lower().strip()
+    sb = get_supabase()
+    results = []
+
+    table_specs = [
+        ("insights", "created_at"),
+        ("recommendations", "created_at"),
+        ("changes", "created_at"),
+        ("snapshots", "fetched_at"),
+    ]
+
+    for table_name, order_col in table_specs:
+        try:
+            rows = (
+                sb.table(table_name)
+                .select("*")
+                .order(order_col, desc=True)
+                .limit(max(top_k * 3, 10))
+                .execute()
+                .data
+            ) or []
+        except Exception:
+            rows = []
+
+        scored = []
+        for r in rows:
+            blob = " ".join([
+                str(r.get("title", "")),
+                str(r.get("summary", "")),
+                str(r.get("recommendation_text", "")),
+                str(r.get("rationale", "")),
+                str(r.get("chunk_text", "")),
+                str(r.get("content", "")),
+                str(r.get("text", "")),
+                str(r.get("category", "")),
+                str(r.get("kind", "")),
+                str(r.get("source_id", "")),
+                str(r.get("file_name", "")),
+            ]).lower()
+
+            overlap = sum(
+                1 for token in q.split()
+                if len(token) > 2 and token in blob
+            )
+
+            risk = safe_int(
+                normalize_risk_score(r.get("risk_score", r.get("final_risk_score"))),
+                default=0
+            )
+
+            recency_boost = 0.0
+            raw_ts = r.get("created_at") or r.get("fetched_at")
+            if raw_ts:
+                try:
+                    created_at = pd.to_datetime(raw_ts, errors="coerce")
+                    if pd.notna(created_at):
+                        now = pd.Timestamp.utcnow()
+                        if getattr(created_at, "tzinfo", None) is not None:
+                            now = now.tz_localize("UTC") if now.tzinfo is None else now
+                        else:
+                            created_at = created_at.tz_localize(None)
+                            now = now.tz_localize(None)
+                        age_days = max((now - created_at).days, 0)
+                        recency_boost = max(0.0, 1.0 - min(age_days / 30.0, 1.0))
+                except Exception:
+                    recency_boost = 0.0
+
+            final_score = overlap + (0.25 * risk) + (0.20 * recency_boost)
+            scored.append((final_score, r))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for final_score, row in scored[:top_k]:
+            if final_score <= 0:
+                continue
+            results.append(
+                normalize_hit(
+                    table_name,
+                    row,
+                    similarity=min(0.99, 0.35 + (0.1 * final_score))
+                )
+            )
+
+    return results
+
+
+def query_needs_fingerprint_boost(question: str) -> bool:
+    q = question.lower()
+    keywords = [
+        "android id", "androidid", "gsf", "mediadrm", "identifier", "device id",
+        "signal", "provider", "fingerprint", "sdk", "fallback", "os build",
+        "hardware signal", "installed apps", "attestation", "emulator", "tamper",
+    ]
+    return any(k in q for k in keywords)
+
+
+def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list:
+    if not results:
+        return []
+
+    q = question.lower()
+    deduped = {}
+    for hit in results:
+        key = (
+            f"{hit.get('source_type')}::{hit.get('title')}"
+            f"::{(hit.get('chunk_text') or '')[:200]}"
         )
 
-        evidence.append({
-            "title": row.get("title"),
-            "chunk_text": chunk_text,
-            "source_id": row.get("source_id"),
-            "snapshot_id": row.get("snapshot_id"),
-            "kind": row.get("kind"),
-            "score": float(row.get("confidence", 0.0)) if pd.notna(row.get("confidence")) else None,
-            "risk_score": safe_int(row.get("risk_score"), default=0),
-            "component": row.get("component"),
-            "category": row.get("category"),
-            "created_at": str(row.get("created_at")),
-        })
+        semantic = safe_similarity(hit.get("score", 0.0))
+        risk = min(max(hit.get("risk_score", 0), 0), 5) / 5.0
+        confidence = min(max(hit.get("confidence", 0.0), 0.0), 1.0)
 
-    return evidence
+        # Only compute recency if the hit actually has created_at
+        recency = 0.0
+        if hit.get("has_created_at"):
+            try:
+                created_at = pd.to_datetime(hit.get("created_at"), errors="coerce")
+                if pd.notna(created_at):
+                    now_ts = pd.Timestamp.utcnow()
+                    if getattr(created_at, "tzinfo", None) is not None:
+                        now_ts = now_ts.tz_localize("UTC") if now_ts.tzinfo is None else now_ts
+                    else:
+                        created_at = created_at.tz_localize(None)
+                        now_ts = now_ts.tz_localize(None)
+                    age_seconds = max((now_ts - created_at).total_seconds(), 0)
+                    age_days = age_seconds / 86400.0
+                    recency = max(0.0, 1.0 - min(age_days / 30.0, 1.0))
+            except Exception:
+                recency = 0.0
+
+        source_boost = {
+            "fingerprint_library_chunks": 0.10,
+            "vector_chunks": 0.08,
+            "recommendations": 0.08,
+            "insights": 0.06,
+            "changes": 0.05,
+            "snapshots": 0.04,
+        }.get(hit.get("source_type"), 0.02)
+
+        if query_needs_fingerprint_boost(question) and hit.get("source_type") == "fingerprint_library_chunks":
+            source_boost += 0.10
+        if any(
+            term in q for term in ["priority", "triage", "action", "recommendation"]
+        ) and hit.get("source_type") == "recommendations":
+            source_boost += 0.06
+
+        final_score = (
+            0.50 * semantic
+            + 0.15 * risk
+            + 0.10 * confidence
+            + 0.15 * recency
+            + source_boost
+        )
+        hit["final_rank_score"] = round(final_score, 4)
+
+        prev = deduped.get(key)
+        if prev is None or hit["final_rank_score"] > prev["final_rank_score"]:
+            deduped[key] = hit
+
+    ranked = sorted(
+        deduped.values(),
+        key=lambda x: x.get("final_rank_score", 0.0),
+        reverse=True
+    )
+    return ranked[:top_k]
 
 
-def answer_from_dashboard(question, df, top_k=5):
-    if df is None or df.empty:
+def retrieve_multisource_context(question: str, top_k: int = 8) -> list:
+    """
+    Pure Supabase retrieval - no dashboard dataframe used.
+    Sources: match_vector_chunks RPC, match_fingerprint_library_chunks RPC,
+             and direct table queries (insights, recommendations, changes, snapshots).
+    """
+    results = []
+    vector_hits = retrieve_vector_chunks(question, top_k=max(4, top_k))
+    fingerprint_hits = retrieve_fingerprint_chunks(question, top_k=max(3, top_k // 2))
+    structured_hits = retrieve_structured_supabase(question, top_k=RAG_STRUCTURED_TOP_K)
+
+    results.extend(vector_hits)
+    results.extend(fingerprint_hits)
+    results.extend(structured_hits)
+
+    return rank_and_dedup_results(results, question, top_k=top_k)
+
+
+def answer_from_supabase_rag(question: str, top_k: int = 8) -> dict:
+    evidence = retrieve_multisource_context(question, top_k=top_k)
+    if not evidence:
         return {
-            "answer": "There is no filtered dashboard data available to answer this question.",
+            "answer": "I could not retrieve any relevant evidence from Supabase for this question.",
             "confidence": 0.0,
-            "evidence": []
+            "evidence": [],
         }
 
-    q = question.strip().lower()
+    q = question.lower().strip()
 
-    ranked = (
-        df.copy()
-        .sort_values(["risk_score", "confidence", "created_at"], ascending=[False, False, False])
-        .reset_index(drop=True)
-    )
+    if any(phrase in q for phrase in ["how many", "count", "number of"]):
+        sb = get_supabase()
+        count_results = {}
 
-    evidence = build_dashboard_evidence(df, top_k=top_k)
-
-    # ── Numeric / count questions ──────────────────────────────────────────────
-    import re
-
-    # "how many" total
-    if re.search(r"how many", q):
-        if re.search(r"high.?risk|risk.*(>=?\s*4|score.*[45]|4 or 5)", q) or "high risk" in q:
-            count = int((df["risk_score"] >= 4).sum())
-            return {"answer": f"There are **{count}** high-risk items (risk score ≥ 4) in the current filtered view.", "confidence": 1.0, "evidence": evidence}
-        if re.search(r"total|insight|item|record|row", q):
-            return {"answer": f"There are **{len(df)}** items in the current filtered view.", "confidence": 1.0, "evidence": evidence}
-        # Generic count fallback
-        return {"answer": f"There are **{len(df)}** items in the current filtered view.", "confidence": 1.0, "evidence": evidence}
-
-    # "what is the average / mean risk"
-    if re.search(r"average|mean|avg", q) and re.search(r"risk|score", q):
-        avg = round(df["risk_score"].mean(), 2)
-        return {"answer": f"The average risk score across the **{len(df)}** filtered items is **{avg}**.", "confidence": 1.0, "evidence": evidence}
-
-    # "what is the average confidence"
-    if re.search(r"average|mean|avg", q) and "confidence" in q:
-        avg = round(df["confidence"].mean(), 2)
-        return {"answer": f"The average confidence across the **{len(df)}** filtered items is **{avg}**.", "confidence": 1.0, "evidence": evidence}
-
-    # "max / maximum risk"
-    if re.search(r"max(imum)?|highest", q) and re.search(r"risk score|risk$", q):
-        mx = safe_int(df["risk_score"].max())
-        top_row = ranked.iloc[0]
-        return {
-            "answer": (
-                f"The maximum risk score in the current view is **{mx}**. "
-                f"The item with the highest risk is \"{top_row.get('title', 'Untitled')}\" "
-                f"(confidence {top_row.get('confidence')}, component {top_row.get('component', 'Unknown')})."
-            ),
-            "confidence": 1.0,
-            "evidence": evidence,
+        table_keyword_map = {
+            "recommendations": ["recommendation", "action item", "action"],
+            "insights": ["insight", "finding"],
+            "changes": ["change", "diff"],
+            "snapshots": ["snapshot"],
         }
 
-    # "top N" with optional number word
-    _top_n_match = re.search(
-        r"top\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)", q
-    )
-    _word_to_n = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                  "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-    if _top_n_match:
-        raw = _top_n_match.group(1)
-        n = _word_to_n.get(raw, None) or int(raw)
-        top_n = ranked.head(n)
-        lines = []
-        for i, (_, row) in enumerate(top_n.iterrows(), start=1):
-            lines.append(
-                f"{i}. {row.get('title', 'Untitled')} "
-                f"(risk={safe_int(row.get('risk_score'))}, "
-                f"confidence={row.get('confidence')}, "
-                f"component={row.get('component', 'Unknown')})"
-            )
-        return {
-            "answer": f"The top {n} items by risk score currently on the dashboard are:\n\n" + "\n".join(lines),
-            "confidence": 0.95,
-            "evidence": evidence,
-        }
+        tables_to_count = []
+        for table, keywords in table_keyword_map.items():
+            if any(kw in q for kw in keywords):
+                tables_to_count.append(table)
 
-    # ── Category / component breakdown ────────────────────────────────────────
-    if re.search(r"break.?down|by category|by component|per category|per component|distribution", q):
-        col = "category" if "category" in q else "component"
-        breakdown = df.groupby(col)["risk_score"].agg(["count", "mean"]).rename(columns={"count": "items", "mean": "avg_risk"})
-        breakdown["avg_risk"] = breakdown["avg_risk"].round(2)
-        lines = [f"- {idx}: {row['items']} items, avg risk {row['avg_risk']}" for idx, row in breakdown.iterrows()]
-        return {
-            "answer": f"Risk breakdown by **{col}**:\n\n" + "\n".join(lines),
-            "confidence": 0.95,
-            "evidence": evidence,
-        }
+        if not tables_to_count:
+            tables_to_count = list(table_keyword_map.keys())
 
-    # ── Highest risk ──────────────────────────────────────────────────────────
-    if "highest risk" in q:
-        row = ranked.iloc[0]
-        return {
-            "answer": (
-                f'The highest risk item currently shown is "{row.get("title", "Untitled")}". '
-                f'Risk score: {safe_int(row.get("risk_score"))}, '
-                f'confidence: {row.get("confidence")}, '
-                f'component: {row.get("component", "Unknown")}.'
-            ),
-            "confidence": 0.95,
-            "evidence": evidence,
-        }
+        for table in tables_to_count:
+            try:
+                resp = sb.table(table).select("id", count="exact").execute()
+                count_results[table] = resp.count if resp.count is not None else len(resp.data or [])
+            except Exception:
+                count_results[table] = "unavailable"
 
-    # ── What changed ─────────────────────────────────────────────────────────
-    if "what changed" in q or "changed since" in q or "last snapshot" in q:
-        return {
-            "answer": "Snapshot comparison is disabled. All items are shown from the current snapshot.",
-            "confidence": 0.5,
-            "evidence": evidence,
-        }
-
-    # ── What data am I looking at ─────────────────────────────────────────────
-    if "what data" in q or "what am i looking at" in q or "which data" in q:
-        min_dt = pd.to_datetime(df["created_at"], errors="coerce").min()
-        max_dt_local = pd.to_datetime(df["created_at"], errors="coerce").max()
-        answer = f"You are viewing **{len(df)}** filtered records."
-        if pd.notna(min_dt) and pd.notna(max_dt_local):
-            answer += f" Time range: {min_dt.date()} to {max_dt_local.date()}."
-        top3_titles = ranked.head(3)["title"].fillna("Untitled").tolist()
-        if top3_titles:
-            answer += " Highest-priority titles: " + ", ".join(top3_titles) + "."
-        return {"answer": answer, "confidence": 0.9, "evidence": evidence}
-
-    # ── Action / triage ───────────────────────────────────────────────────────
-    if re.search(r"action|what should|what do i|right now|triage|priorit", q):
-        action_rows = ranked.head(3)
-        lines = []
-        for i, (_, row) in enumerate(action_rows.iterrows(), start=1):
-            actions = normalize_actions(row.get("recommended_actions", []))
-            action_str = actions[0] if actions else "Review and triage"
-            lines.append(
-                f"{i}. **{row.get('title', 'Untitled')}** "
-                f"(risk={safe_int(row.get('risk_score'))}, conf={row.get('confidence')})\n"
-                f"   - Suggested action: {action_str}"
-            )
-        return {
-            "answer": "Top items to triage now:\n\n" + "\n".join(lines),
-            "confidence": 0.9,
-            "evidence": evidence,
-        }
-
-    # ── Rationale for a specific item ─────────────────────────────────────────
-    if "rationale" in q or "why" in q or "reason" in q:
-        # Try to match a title keyword from the question
-        matched = None
-        for _, row in ranked.iterrows():
-            title_words = set(str(row.get("title", "")).lower().split())
-            q_words = set(q.split())
-            if len(title_words & q_words) >= 2:
-                matched = row
-                break
-        if matched is None:
-            matched = ranked.iloc[0]
-        rationale = matched.get("rationale", matched.get("summary", "No rationale available."))
-        return {
-            "answer": f"**{matched.get('title', 'Untitled')}**\n\nRationale: {rationale}",
-            "confidence": 0.85,
-            "evidence": evidence,
-        }
-
-    # ── Generic fallback: show top 5 with stats ───────────────────────────────
-    total = len(df)
-    high = int((df["risk_score"] >= 4).sum())
-    avg = round(df["risk_score"].mean(), 2)
-    top5 = ranked.head(5)
-    lines = []
-    for i, (_, row) in enumerate(top5.iterrows(), start=1):
-        lines.append(
-            f"{i}. {row.get('title', 'Untitled')} "
-            f"(risk={safe_int(row.get('risk_score'))}, conf={row.get('confidence')}, component={row.get('component', '')})"
+        parts = [f"{k}: **{v}**" for k, v in count_results.items()]
+        total = sum(v for v in count_results.values() if isinstance(v, int))
+        answer = (
+            f"Exact counts from Supabase:\n\n"
+            + "\n".join(f"- {p}" for p in parts)
+            + f"\n\n**Total: {total}**"
         )
+        return {"answer": answer, "confidence": 0.95, "evidence": evidence}
+
+    if any(term in q for term in ["top", "highest", "priority", "triage", "action"]):
+        lines = []
+        for i, ev in enumerate(evidence[:5], start=1):
+            lines.append(
+                f"{i}. **{ev.get('title', 'Untitled')}** "
+                f"[{ev.get('source_type')}] - risk {ev.get('risk_score', 0)}, "
+                f"score {round(ev.get('final_rank_score', 0.0), 2)}"
+            )
+        return {
+            "answer": "Top relevant Supabase-backed evidence:\n\n" + "\n".join(lines),
+            "confidence": round(
+                min(0.95, max(0.55, evidence[0].get("final_rank_score", 0.0))), 2
+            ),
+            "evidence": evidence,
+        }
+
+    top = evidence[0]
+
+    # Build a proper sentence-boundary truncation
+    def truncate_at_sentence(text: str, max_chars: int = 400) -> str:
+        text = (text or "").replace("\n", " ").strip()
+        if len(text) <= max_chars:
+            return text
+        # Try to cut at last sentence boundary before max_chars
+        truncated = text[:max_chars]
+        for sep in [". ", "! ", "? "]:
+            last = truncated.rfind(sep)
+            if last != -1:
+                return truncated[:last + 1]
+        # No sentence boundary found - cut at last word boundary
+        last_space = truncated.rfind(" ")
+        if last_space != -1:
+            return truncated[:last_space] + "."
+        return truncated + "."
+
+    support_lines = []
+    for i, ev in enumerate(evidence[:4], start=1):
+        excerpt = truncate_at_sentence(ev.get("chunk_text", ""), max_chars=600)
+        support_lines.append(
+            f"{i}. **[{ev.get('source_type')}] {ev.get('title', 'Untitled')}**\n   {excerpt}"
+        )
+
+    answer = (
+        f"Based on Supabase retrieval, the strongest match is **{top.get('title', 'Untitled')}** "
+        f"from **{top.get('source_type')}**.\n\n"
+        f"**Supporting evidence:**\n\n" + "\n\n".join(support_lines)
+    )
+
+    conf = round(min(0.95, max(0.40, evidence[0].get("final_rank_score", 0.0))), 2)
+
     return {
-        "answer": (
-            f"Current dashboard summary: **{total}** items, **{high}** high-risk (≥4), average risk **{avg}**.\n\n"
-            "Top items by risk:\n\n" + "\n".join(lines)
-        ),
-        "confidence": 0.75,
+        "answer": answer,
+        "confidence": conf,
         "evidence": evidence,
     }
 
@@ -1023,8 +1280,8 @@ def answer_from_dashboard(question, df, top_k=5):
 question = st.text_input("Ask a question about risk insights, changes, or signals")
 
 if st.button("Ask") and question.strip():
-    with st.spinner("Answering from current dashboard data..."):
-        result = answer_from_dashboard(question, df, top_k=5)
+    with st.spinner("Retrieving from Supabase and ranking evidence..."):
+        result = answer_from_supabase_rag(question, top_k=RAG_TOP_K)
         st.session_state.chat_history.append({
             "question": question,
             "result": result,
@@ -1044,10 +1301,15 @@ for item in reversed(st.session_state.chat_history):
             st.write("No evidence retrieved.")
         else:
             for idx, ev in enumerate(evidence, start=1):
-                st.markdown(f"**Source {idx}: {ev.get('title', 'Untitled')}**")
-                st.write(ev.get("chunk_text", "")[:1000])
+                st.markdown(
+                    f"**Source {idx}: {ev.get('title', 'Untitled')}**  "
+                    f"`{ev.get('source_type', 'unknown')}`  "
+                    f"score={round(ev.get('final_rank_score', ev.get('score', 0.0)), 3)}"
+                )
+                st.write(ev.get("chunk_text", "")[:1500])
 
                 meta = {
+                    "source_type": ev.get("source_type"),
                     "source_id": ev.get("source_id"),
                     "snapshot_id": ev.get("snapshot_id"),
                     "kind": ev.get("kind"),
@@ -1055,6 +1317,8 @@ for item in reversed(st.session_state.chat_history):
                     "component": ev.get("component"),
                     "category": ev.get("category"),
                     "score": ev.get("score"),
+                    "final_rank_score": ev.get("final_rank_score"),
                     "created_at": ev.get("created_at"),
+                    "has_created_at": ev.get("has_created_at"),
                 }
                 st.json(meta)
