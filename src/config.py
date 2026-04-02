@@ -9,8 +9,8 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 USER_AGENT = os.getenv("USER_AGENT", "android-risk-agents-bot/0.1")
 
 # ---- Vector / embeddings (pgvector) ----
-# Your Supabase table uses vector(384)
-VECTOR_DIM = int(os.getenv("VECTOR_DIM", "384"))
+# Nomic v1.5 outputs 768-dimensional vectors
+VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 VECTOR_TABLE = os.getenv("VECTOR_TABLE", "vector_chunks")
 VECTOR_RPC_MATCH = os.getenv("VECTOR_RPC_MATCH", "match_vector_chunks")
 

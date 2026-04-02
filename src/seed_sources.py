@@ -10,6 +10,7 @@ SOURCES = [
     {"name": "Android Developers Blog", "url": "https://android-developers.googleblog.com/", "fetch_type": "html"},
     {"name": "Google Play Developer Policy Center", "url": "https://play.google/developer-content-policy/", "fetch_type": "html"},
     {"name": "Play Integrity API Docs", "url": "https://developer.android.com/google/play/integrity", "fetch_type": "html"},
+    {"name": "Android SDK Platform Releases", "url": "https://developer.android.com/tools/releases/platforms", "fetch_type": "html"}
 ]
 
 def main():
