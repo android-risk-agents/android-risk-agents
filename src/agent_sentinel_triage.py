@@ -24,6 +24,38 @@ logger = logging.getLogger(__name__)
 
 
 RISK_CATEGORIES: List[Dict[str, Any]] = [
+    # --- HIGH PRIORITY: TransUnion core use case ---
+    {
+        "id": "device_identification",
+        "label": "Device Identification",
+        "base_risk": "high",
+        "description": (
+            "Changes affecting Android device identification signals used for risk "
+            "scoring and identity verification: Android ID lifecycle, hardware "
+            "identifiers (IMEI, serial number, MAC address), unique device tokens, "
+            "Google Advertising ID (GAID) access or deprecation, identifier "
+            "persistence across factory reset, cross-app device linking, device "
+            "binding APIs, changes to getDeviceId or TelephonyManager APIs, and "
+            "any platform update that alters how a device is uniquely identified "
+            "across sessions or installs for fraud and credit risk purposes."
+        ),
+    },
+    {
+        "id": "fingerprint_identification",
+        "label": "Fingerprint and Device Identification Library",
+        "base_risk": "high",
+        "description": (
+            "Changes affecting mobile device fingerprinting libraries and "
+            "identification SDKs: updates to Fingerprint Pro for Android, "
+            "FingerprintJS, device fingerprint signal collection (canvas, "
+            "WebGL, font enumeration, screen metrics, sensor data), browser "
+            "fingerprinting on Android WebView, fingerprint stability across "
+            "app updates, anti-fingerprinting mitigations in Android WebView "
+            "or Chrome, changes to fingerprint signal availability due to "
+            "Android privacy changes, and SDK version compatibility with "
+            "new Android releases affecting fingerprint accuracy or confidence scores."
+        ),
+    },
     {
         "id": "device_integrity",
         "label": "Device Integrity",
@@ -47,6 +79,19 @@ RISK_CATEGORIES: List[Dict[str, Any]] = [
             "sensor permission restrictions, reduction of device signal fidelity, "
             "identifier randomisation, privacy sandbox changes affecting attribution, "
             "and removal of previously available risk signals."
+        ),
+    },
+    # --- MEDIUM PRIORITY ---
+    {
+        "id": "malware_exposure",
+        "label": "Malware Exposure",
+        "base_risk": "medium",
+        "description": (
+            "Active Android malware campaigns, exploit-in-the-wild CVEs targeting "
+            "Android, banking trojans, spyware, adware, ransomware targeting Android "
+            "devices, zero-day vulnerabilities in Android framework or kernel, "
+            "privilege escalation exploits, remote code execution vulnerabilities, "
+            "and CISA Known Exploited Vulnerabilities affecting Android."
         ),
     },
     {
@@ -73,28 +118,17 @@ RISK_CATEGORIES: List[Dict[str, Any]] = [
             "platform changes, and regulatory compliance requirements for Android apps."
         ),
     },
+    # --- LOW PRIORITY ---
     {
         "id": "network_security",
         "label": "Network Security",
-        "base_risk": "medium",
+        "base_risk": "low",
         "description": (
             "Android network security configuration changes, cleartext traffic "
             "restrictions, certificate pinning, TLS version enforcement, "
             "Private DNS (DNS-over-TLS), VPN permission changes, network "
             "permission restrictions, WebView security updates, and changes "
             "to how Android handles SSL/TLS certificates or proxies."
-        ),
-    },
-    {
-        "id": "malware_exposure",
-        "label": "Malware Exposure",
-        "base_risk": "high",
-        "description": (
-            "Active Android malware campaigns, exploit-in-the-wild CVEs targeting "
-            "Android, banking trojans, spyware, adware, ransomware targeting Android "
-            "devices, zero-day vulnerabilities in Android framework or kernel, "
-            "privilege escalation exploits, remote code execution vulnerabilities, "
-            "and CISA Known Exploited Vulnerabilities affecting Android."
         ),
     },
     {
@@ -276,6 +310,8 @@ def _detect_source_type(url: str) -> str:
         return "Google Play Developer Policy Center"
     if "developer.android.com" in u and "integrity" in u:
         return "Play Integrity API documentation"
+    if "fingerprint.com" in u or "fingerprintjs" in u or "fpjs.io" in u:
+        return "Fingerprint device identification library"
     return "Android ecosystem source"
 
 
@@ -355,6 +391,8 @@ def _derive_tags(classification: Dict[str, Any], url: str) -> List[str]:
         tags.append("nvd-cve")
     if "osv" in url.lower():
         tags.append("osv")
+    if "fingerprint.com" in url.lower() or "fingerprintjs" in url.lower() or "fpjs.io" in url.lower():
+        tags.append("fingerprint-library")
     return tags[:8]
 
 
