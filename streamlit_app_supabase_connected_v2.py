@@ -1,6 +1,8 @@
+import base64
 import os
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,25 +12,76 @@ import streamlit as st
 from dotenv import load_dotenv
 from supabase import create_client
 
-# ----------------------------
 # Page config
-# ----------------------------
 st.set_page_config(page_title="Android Risk Executive Dashboard", layout="wide")
 
-st.title("Android Risk Agents – Executive Risk Intelligence Dashboard")
-st.markdown("Strategic Risk Posture, Exposure Concentration, Change Intelligence & Actionability")
+def svg_to_b64_img(path: str, height: int = 56) -> str:
+    """Read an SVG file and return an <img> tag with base64-encoded src."""
+    try:
+        svg_bytes = Path(path).read_bytes()
+        b64 = base64.b64encode(svg_bytes).decode("utf-8")
+        return (
+            f'<img src="data:image/svg+xml;base64,{b64}" '
+            f'style="height:{height}px; object-fit:contain;" />'
+        )
+    except Exception:
+        return ""
+
+# ── Header with logos ─────────────────────────────────────────────────────────
+ASSETS_DIR = Path(__file__).parent / "assets"
+uic_img_tag        = svg_to_b64_img(ASSETS_DIR / "UIC Logo.SVG",         height=64)
+transunion_img_tag = svg_to_b64_img(ASSETS_DIR / "transunion logo.svg",  height=38)
+
+col_logo_left, col_title, col_logo_right = st.columns([1, 4, 1])
+
+with col_logo_left:
+    if uic_img_tag:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;height:80px;">{uic_img_tag}</div>',
+            unsafe_allow_html=True,
+        )
+
+with col_title:
+    st.markdown(
+        """
+        <div style="text-align:center; padding:8px 0 4px 0;">
+            <h2 style="margin:0; font-size:1.45rem; font-weight:700; line-height:1.25;">
+                Android Risk Agents – Executive Risk Intelligence Dashboard
+            </h2>
+            <p style="margin:4px 0 0 0; color:#888; font-size:0.88rem;">
+                Strategic Risk Posture &nbsp;·&nbsp; Exposure Concentration
+                &nbsp;·&nbsp; Change Intelligence &nbsp;·&nbsp; Actionability
+            </p>
+            <p style="margin:4px 0 0 0; color:#aaa; font-size:0.78rem;">
+                UIC Liautaud Graduate School of Business &nbsp;|&nbsp;
+                IDS 560 &nbsp;|&nbsp; Group 2 &nbsp;|&nbsp;
+                Industry Partner: TransUnion
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col_logo_right:
+    if transunion_img_tag:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;justify-content:flex-end;height:80px;">'
+            f'{transunion_img_tag}</div>',
+            unsafe_allow_html=True,
+        )
+
 st.markdown("---")
 
-# ----------------------------
-# Env / Supabase
-# ----------------------------
+# ── Env / Supabase ────────────────────────────────────────────────────────────
 load_dotenv()
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
 INSIGHTS_TABLE = os.getenv("INSIGHTS_TABLE", "insights")
 DEFAULT_FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "500"))
 
-# ---- RAG / embedding env ----
+# ── RAG / embedding env ───────────────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 VECTOR_RPC_MATCH = os.getenv("VECTOR_RPC_MATCH", "match_vector_chunks")
 VECTOR_TABLE = os.getenv("VECTOR_TABLE", "vector_chunks")
@@ -42,13 +95,12 @@ FINGERPRINT_ENABLED = os.getenv("FINGERPRINT_ENABLED", "true").lower() == "true"
 @st.cache_resource
 def get_supabase():
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY")
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE key in .env file")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ── General helpers ───────────────────────────────────────────────────────────
+
 def sim(a: str, b: str) -> float:
     return SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio()
 
@@ -115,9 +167,8 @@ def normalize_risk_score(x):
         return np.nan
     if val <= 1.0:
         val = round(val * 5)
-        return int(max(1, min(5, val)))
-    if val > 5:
-        val = val / 20.0
+        val = max(1, min(5, int(val)))
+        return val
     return int(max(1, min(5, round(val))))
 
 
@@ -135,6 +186,7 @@ def normalize_confidence(x):
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     needed = {
+        "url": "",
         "title": "",
         "summary": "",
         "risk_score": np.nan,
@@ -150,7 +202,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         "notes": "",
         "snapshot_id": "snapshot_unknown",
         "source_id": "",
-        "_source_table": "insights",
+        "source_name": "Unknown",
     }
     out = df.copy()
     for col, default in needed.items():
@@ -158,6 +210,8 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = default
     return out
 
+
+# ── Supabase data fetch ───────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
 def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFrame:
@@ -171,8 +225,32 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
         .execute()
         .data
     )
-
     df_insights = pd.DataFrame(insights_rows or [])
+
+    source_rows = (
+        sb.table("sources")
+        .select("id, url, name")
+        .execute()
+        .data
+    )
+    df_sources = pd.DataFrame(source_rows or [])
+
+    if not df_sources.empty and "source_id" in df_insights.columns:
+        src_map = df_sources.rename(columns={"url": "source_url"})
+        if "name" in src_map.columns:
+            src_map = src_map.rename(columns={"name": "source_name"})
+
+        df_insights = df_insights.merge(
+            src_map,
+            left_on="source_id",
+            right_on="id",
+            how="left",
+        )
+
+        if "source_name" not in df_insights.columns:
+            df_insights["source_name"] = (
+                df_insights.get("source_url", df_insights["source_id"].astype(str))
+            )
 
     rec_rows = (
         sb.table("recommendations")
@@ -182,124 +260,34 @@ def fetch_insights_from_supabase(limit: int = DEFAULT_FETCH_LIMIT) -> pd.DataFra
         .execute()
         .data
     )
-
     df_recs = pd.DataFrame(rec_rows or [])
 
     if not df_recs.empty:
-        df_recs = df_recs.rename(columns={
-            "final_risk_score": "risk_score"
-        })
-
-        if "title" not in df_recs.columns:
-            df_recs["title"] = "Recommendation"
-        if "recommendation_text" in df_recs.columns:
-            df_recs["summary"] = df_recs["recommendation_text"].fillna("")
-        elif "summary" not in df_recs.columns:
-            df_recs["summary"] = ""
-        if "source_id" in df_recs.columns:
-            df_recs["component"] = df_recs["source_id"].astype(str).fillna("Recommendation Engine")
-        elif "component" not in df_recs.columns:
-            df_recs["component"] = "Recommendation Engine"
-        if "category" in df_recs.columns:
-            df_recs["kind"] = df_recs["category"].fillna("recommendation")
-        elif "kind" not in df_recs.columns:
-            df_recs["kind"] = "recommendation"
-        if "confidence" not in df_recs.columns:
-            df_recs["confidence"] = 0.7
+        df_recs = df_recs.rename(columns={"final_risk_score": "risk_score"})
+        df_recs["title"] = df_recs.get("title", "Recommendation")
+        df_recs["summary"] = df_recs.get("recommendation_text", "")
+        df_recs["component"] = df_recs.get("source_id", "Recommendation Engine")
+        df_recs["kind"] = df_recs.get("category", "recommendation")
+        df_recs["source_name"] = df_recs.get("source_name", "Recommendation Engine")
         df_recs["confidence"] = df_recs["confidence"].apply(normalize_confidence)
         df_recs["risk_score"] = df_recs["risk_score"].apply(normalize_risk_score)
         df_recs["created_at"] = pd.to_datetime(df_recs["created_at"], errors="coerce")
-        df_recs["_source_table"] = "recommendations"
 
     if not df_insights.empty:
         df_insights = ensure_columns(df_insights)
         df_insights["confidence"] = df_insights["confidence"].apply(normalize_confidence)
         df_insights["risk_score"] = df_insights["risk_score"].apply(normalize_risk_score)
         df_insights["created_at"] = pd.to_datetime(df_insights["created_at"], errors="coerce")
-        df_insights["_source_table"] = "insights"
 
     df_combined = pd.concat([df_insights, df_recs], ignore_index=True)
-    df_combined["risk_score"] = df_combined["risk_score"].fillna(0)
-    df_combined["confidence"] = df_combined["confidence"].fillna(0.0)
-    df_combined = df_combined.dropna(subset=["created_at"])
+    df_combined = df_combined.dropna(subset=["created_at", "risk_score", "confidence"])
+
+    if "source_name" not in df_combined.columns:
+        df_combined["source_name"] = df_combined.get("source_id", "Unknown").fillna("Unknown")
+    else:
+        df_combined["source_name"] = df_combined["source_name"].fillna("Unknown")
 
     return df_combined
-
-
-def make_mock_data():
-    n = 22
-    base = pd.DataFrame({
-        "title": [f"Insight {i}" for i in range(1, n + 1)],
-        "risk_score": np.random.choice([1, 1, 2, 2, 3, 3, 4, 4, 5], size=n, replace=True),
-        "confidence": np.round(np.random.uniform(0.5, 1.0, size=n), 2),
-        "created_at": pd.date_range(start="2026-03-01", periods=n, freq="12H"),
-        "component": np.random.choice(["Auth", "Network", "Storage", "Payments", "UI", "Telemetry"], size=n),
-        "kind": np.random.choice(["permission", "api_change", "config", "dependency", "logging"], size=n),
-    })
-
-    base["summary"] = base.apply(
-        lambda r: f"Detected change in {r['component']} ({r['kind']}). Potential risk requires review.", axis=1
-    )
-    base["recommended_actions"] = base.apply(
-        lambda r: [
-            "Validate scope/impact",
-            "Add targeted tests",
-            "Review permissions/data flows" if r["kind"] == "permission" else "Review change rationale",
-        ],
-        axis=1,
-    )
-
-    base["status"] = "New"
-    base["owner"] = ""
-    base["due_date"] = (base["created_at"] + pd.to_timedelta(7, unit="D")).dt.date.astype(str)
-    base["notes"] = ""
-
-    old = base.copy()
-    old["snapshot_id"] = "snapshot_old"
-    old["created_at"] = old["created_at"] - pd.to_timedelta(3, unit="D")
-
-    new = base.copy()
-    new["snapshot_id"] = "snapshot_new"
-
-    rng = np.random.default_rng(7)
-    mod_idx = rng.choice(new.index, size=max(4, n // 5), replace=False)
-    new.loc[mod_idx, "risk_score"] = np.clip(new.loc[mod_idx, "risk_score"] + 1, 1, 5)
-    new.loc[mod_idx, "confidence"] = np.clip(new.loc[mod_idx, "confidence"] + 0.05, 0.0, 1.0)
-    new.loc[mod_idx, "summary"] = new.loc[mod_idx, "summary"].astype(str) + " Updated signals increased risk."
-
-    remove_idx = set(rng.choice(new.index, size=3, replace=False).tolist())
-    new = new.drop(index=list(remove_idx)).reset_index(drop=True)
-
-    add_n = 4
-    added = pd.DataFrame({
-        "title": [f"New Insight {i}" for i in range(1, add_n + 1)],
-        "risk_score": rng.choice([3, 4, 5], size=add_n),
-        "confidence": np.round(rng.uniform(0.65, 1.0, size=add_n), 2),
-        "created_at": pd.date_range(start="2026-03-05", periods=add_n, freq="6H"),
-        "component": rng.choice(["Auth", "Network", "Storage", "Payments", "UI", "Telemetry"], size=add_n),
-        "kind": rng.choice(["permission", "api_change", "config", "dependency", "logging"], size=add_n),
-    })
-    added["summary"] = added.apply(
-        lambda r: f"Newly detected change in {r['component']} ({r['kind']}). Requires triage.", axis=1
-    )
-    added["recommended_actions"] = added.apply(
-        lambda r: [
-            "Triage and assign owner",
-            "Confirm exploitability",
-            "Add monitoring / logging" if r["kind"] == "logging" else "Patch or mitigate",
-        ],
-        axis=1,
-    )
-    added["status"] = "New"
-    added["owner"] = ""
-    added["due_date"] = (pd.to_datetime(added["created_at"]) + pd.to_timedelta(5, unit="D")).dt.date.astype(str)
-    added["notes"] = ""
-    added["snapshot_id"] = "snapshot_new"
-
-    new = pd.concat([new, added], ignore_index=True)
-    all_df = pd.concat([old, new], ignore_index=True)
-    all_df["created_at"] = pd.to_datetime(all_df["created_at"])
-    return all_df
 
 
 def cluster_titles(d: pd.DataFrame, threshold=0.86):
@@ -354,72 +342,85 @@ def compute_diff(df_old: pd.DataFrame, df_new: pd.DataFrame):
         else:
             persisting_rows.append(n)
 
-    changed_df = pd.DataFrame(changed_rows) if changed_rows else pd.DataFrame(columns=list(df_new.columns) + [
-        "old_risk_score", "old_confidence", "old_summary", "delta_risk", "delta_conf"
-    ])
+    changed_df = pd.DataFrame(changed_rows) if changed_rows else pd.DataFrame(
+        columns=list(df_new.columns) + ["old_risk_score", "old_confidence", "old_summary", "delta_risk", "delta_conf"]
+    )
     persisting_df = pd.DataFrame(persisting_rows) if persisting_rows else pd.DataFrame(columns=df_new.columns)
-
     return added, removed, changed_df, persisting_df
 
 
-# ----------------------------
-# Load data
-# ----------------------------
+# ── Sidebar: data source label ────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Data source")
-    use_mock_fallback = st.toggle("Use mock fallback if Supabase fails", value=True)
+    st.caption("Supabase")
 
-load_error = None
 try:
     all_df = fetch_insights_from_supabase(DEFAULT_FETCH_LIMIT)
     data_mode = "Supabase"
     if all_df.empty:
         raise RuntimeError(f"No rows found in table '{INSIGHTS_TABLE}'.")
 except Exception as e:
-    load_error = str(e)
-    if use_mock_fallback:
-        all_df = make_mock_data()
-        data_mode = "Mock fallback"
-    else:
-        st.error(f"Failed to load data from Supabase: {e}")
-        st.stop()
+    st.error(f"Failed to load data from Supabase: {e}")
+    st.stop()
 
 st.caption(f"Data source: **{data_mode}**")
-if load_error and data_mode == "Mock fallback":
-    st.warning(f"Supabase load failed, so the app is showing mock data instead: {load_error}")
 
 if "triage" not in st.session_state:
     st.session_state.triage = {}
 
-# ----------------------------
-# Sidebar filters
-# ----------------------------
+
+# ── Sidebar filters ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Filters")
 
-    snapshots = sorted([s for s in all_df["snapshot_id"].dropna().astype(str).unique().tolist() if s])
+    source_names = sorted(
+        all_df["source_name"].fillna("Unknown").astype(str).unique().tolist()
+    )
+    if not source_names:
+        source_names = ["Unknown"]
+        all_df["source_name"] = "Unknown"
+
+    default_source = source_names[0]
+    selected_source = st.selectbox(
+        "Source",
+        source_names,
+        index=source_names.index(default_source),
+    )
+
+    source_df = all_df[
+        all_df["source_name"].fillna("Unknown").astype(str) == str(selected_source)
+    ].copy()
+
+    snapshots = sorted(
+        [s for s in source_df["snapshot_id"].dropna().astype(str).unique().tolist() if s]
+    )
     if not snapshots:
         snapshots = ["snapshot_unknown"]
-        all_df["snapshot_id"] = "snapshot_unknown"
+        source_df["snapshot_id"] = "snapshot_unknown"
 
     default_new = snapshots[-1]
+    default_old = snapshots[-2] if len(snapshots) >= 2 else snapshots[0]
 
-    snap_new = st.selectbox("Snapshot", snapshots, index=snapshots.index(default_new))
-    snap_old = None
-    enable_compare = False
+    enable_compare = st.toggle("Compare snapshots", value=(len(snapshots) >= 2))
+
+    if enable_compare and len(snapshots) >= 2:
+        snap_new = st.selectbox("New snapshot", snapshots, index=snapshots.index(default_new))
+        snap_old = st.selectbox("Old snapshot", snapshots, index=snapshots.index(default_old))
+    else:
+        snap_new = st.selectbox("Snapshot", snapshots, index=snapshots.index(default_new))
+        snap_old = None
 
     st.divider()
 
-    max_dt = all_df["created_at"].max()
+    max_dt = source_df["created_at"].max() if not source_df.empty else all_df["created_at"].max()
     days = st.number_input("Recent days", min_value=1, max_value=365, value=14, step=1)
-    _max_dt_naive = max_dt.replace(tzinfo=None) if pd.notna(max_dt) and hasattr(max_dt, "tzinfo") else max_dt
-    start_dt = _max_dt_naive - timedelta(days=int(days)) if pd.notna(max_dt) else datetime.utcnow() - timedelta(days=14)
+    start_dt = max_dt - timedelta(days=int(days)) if pd.notna(max_dt) else datetime.utcnow() - timedelta(days=14)
 
     min_risk = st.slider("Min risk score", min_value=1, max_value=5, value=3, step=1)
     min_conf = st.slider("Min confidence", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
 
-    comps = sorted(all_df["component"].fillna("Unknown").astype(str).unique().tolist())
-    kinds = sorted(all_df["kind"].fillna("unknown").astype(str).unique().tolist())
+    comps = sorted(source_df["component"].fillna("Unknown").astype(str).unique().tolist()) if not source_df.empty else []
+    kinds = sorted(source_df["kind"].fillna("unknown").astype(str).unique().tolist()) if not source_df.empty else []
     sel_comps = st.multiselect("Component", comps, default=comps)
     sel_kinds = st.multiselect("Kind", kinds, default=kinds)
 
@@ -434,31 +435,45 @@ with st.sidebar:
     st.divider()
     row_limit = st.slider("Max rows in lists", 10, 200, 50, 10)
 
+    st.markdown("---")
+    st.markdown("### 👥 Project Team")
+    st.markdown("""
+• **Ishdeep Singh**  
+🔗 [LinkedIn](https://www.linkedin.com/in/ishdeepsgh/)
 
-df_new = all_df.copy()
+• **Ishan Singh**  
+🔗 [LinkedIn](https://www.linkedin.com/in/ishansingh98/)
 
-_real_snapshots = [s for s in all_df["snapshot_id"].dropna().astype(str).unique()
-                   if s not in ("snapshot_unknown", "", "nan")]
-if _real_snapshots:
-    df_new = all_df[all_df["snapshot_id"].astype(str) == str(snap_new)].copy()
+• **Kiran Kumar**  
+🔗 [LinkedIn](https://www.linkedin.com/in/kiran-kumar-srinivasa-37b57017b/)
 
-df_old = None
-if snap_old and _real_snapshots:
-    df_old = all_df[all_df["snapshot_id"].astype(str) == str(snap_old)].copy()
+• **Rameen Shakeel**  
+🔗 [LinkedIn](https://www.linkedin.com/in/rameen-shakeel-16442a221/)
+
+• **Seungmin Pack**  
+🔗 [LinkedIn](https://www.linkedin.com/in/seungminpack/)
+
+• **Hadiqa Shah**  
+🔗 [LinkedIn](https://www.linkedin.com/in/hadiqa-shah/)
+    """)
+
+
+# ── Filter dataframe ──────────────────────────────────────────────────────────
+base_df = all_df[
+    all_df["source_name"].fillna("Unknown").astype(str) == str(selected_source)
+].copy()
+
+df_new = base_df[base_df["snapshot_id"].astype(str) == str(snap_new)].copy()
+df_old = base_df[base_df["snapshot_id"].astype(str) == str(snap_old)].copy() if snap_old else None
 
 df = df_new.copy()
-
-_start_dt = pd.to_datetime(start_dt)
-if df["created_at"].dt.tz is not None and _start_dt.tzinfo is None:
-    _start_dt = _start_dt.replace(tzinfo=timezone.utc)
-elif df["created_at"].dt.tz is None and _start_dt.tzinfo is not None:
-    _start_dt = _start_dt.replace(tzinfo=None)
-
-df = df[df["created_at"] >= _start_dt]
+df = df[df["created_at"] >= pd.to_datetime(start_dt)]
 df = df[df["risk_score"] >= min_risk]
 df = df[df["confidence"] >= min_conf]
-df = df[df["component"].isin(sel_comps)]
-df = df[df["kind"].isin(sel_kinds)]
+if sel_comps:
+    df = df[df["component"].isin(sel_comps)]
+if sel_kinds:
+    df = df[df["kind"].isin(sel_kinds)]
 if q.strip():
     qq = q.strip().lower()
     df = df[df["title"].astype(str).str.lower().str.contains(qq) | df["summary"].astype(str).str.lower().str.contains(qq)]
@@ -479,6 +494,13 @@ else:
 
 df = df.head(int(row_limit)).copy()
 
+diff_added = None
+diff_removed = None
+diff_changed = None
+diff_persisting = None
+if enable_compare and df_old is not None and not df_old.empty:
+    diff_added, diff_removed, diff_changed, diff_persisting = compute_diff(df_old, df_new)
+
 
 def apply_triage(row):
     k = stable_key(row)
@@ -492,9 +514,8 @@ def apply_triage(row):
 if len(df) > 0:
     df = df.apply(apply_triage, axis=1)
 
-# ----------------------------
-# KPIs
-# ----------------------------
+
+# ── KPIs ──────────────────────────────────────────────────────────────────────
 total_insights = len(df)
 avg_risk = round(df["risk_score"].mean(), 2) if total_insights else 0
 max_risk = int(df["risk_score"].max()) if total_insights else 0
@@ -518,165 +539,129 @@ elif high_risk_pct > 15:
 else:
     risk_status = "🟢 Controlled Risk Exposure"
 
-st.markdown("## 🔎 Executive Risk Summary")
-st.markdown(f"""
-**Current Portfolio Status:** {risk_status}
+diff_added = None
+diff_removed = None
+diff_changed = None
+diff_persisting = None
 
-- Time window: last **{int(days)}** days (from {pd.to_datetime(start_dt).date()} to {pd.to_datetime(max_dt).date() if pd.notna(max_dt) else 'N/A'})
-- {high_risk_pct}% of filtered insights are high severity (risk ≥4)
-- Dispersion index (variance): **{risk_variance}**
-""")
 
-_rec_df = all_df[all_df["_source_table"] == "recommendations"].copy() if "_source_table" in all_df.columns else pd.DataFrame()
-_high_recs = (
-    _rec_df[_rec_df["risk_score"] >= 4]
-    .sort_values(["risk_score", "confidence"], ascending=[False, False])
-    .head(5)
-    if not _rec_df.empty else pd.DataFrame()
-)
-
-if not _high_recs.empty:
-    st.markdown("### 🚨 High Priority Updates")
-    for _, rec in _high_recs.iterrows():
-        priority_label = rec.get("priority", "")
-        title = rec.get("title", "Untitled")
-        rationale = rec.get("rationale", "")
-        raw_actions = rec.get("recommended_actions", [])
-        actions = normalize_actions(raw_actions)
-        risk = safe_int(rec.get("risk_score", 0))
-        conf = rec.get("confidence", "")
-
-        with st.expander(f"{'🔴' if risk >= 4 else '🟡'} [{priority_label}] {title}  —  Risk {risk} | Conf {conf}", expanded=(risk == 5)):
-            if rationale:
-                st.markdown(f"**Rationale:** {rationale}")
-            if actions:
-                st.markdown("**Recommended Actions:**")
-                for act in actions:
-                    st.markdown(f"- {act}")
-else:
-    st.info("No high-priority recommendations available under current filters.")
-
-st.markdown("---")
-
-diff_added = diff_removed = diff_changed = diff_persisting = None
-
-st.markdown("---")
-
-# ----------------------------
-# Charts
-# ----------------------------
-st.header("Executive Intelligence Overview")
-
+# ── Executive Risk Overview ───────────────────────────────────────────────────
 df_exec = all_df.copy()
 df_exec = df_exec[df_exec["risk_score"] > 0]
-
 df_exec["risk_score"] = pd.to_numeric(df_exec["risk_score"], errors="coerce")
 df_exec["confidence"] = pd.to_numeric(df_exec["confidence"], errors="coerce")
-
 df_exec["weighted_risk"] = df_exec["risk_score"] * df_exec["confidence"]
+df_exec = df_exec.drop_duplicates(subset=["title"])
+
+top_items = (
+    df_exec
+    .groupby("title", as_index=False)
+    .agg({"risk_score": "max", "confidence": "max", "weighted_risk": "max", "category": "first"})
+    .sort_values("weighted_risk", ascending=False)
+    .head(3)
+)
+
+st.markdown("## 🔎 Executive Risk Overview")
+
+total_high = len(df_exec[df_exec["risk_score"] >= 4])
+
+dominant_domain = (
+    df_exec.groupby("category")["weighted_risk"]
+    .sum()
+    .sort_values(ascending=False)
+    .index[0]
+)
+
+st.markdown(f"""
+• **{total_high} high-risk issues** currently active across the ecosystem  
+• Risk exposure is **primarily concentrated in the {dominant_domain} domain**  
+• Top risk drivers contributing to weighted exposure:
+""")
+
+for _, row in top_items.iterrows():
+    st.markdown(
+        f"    • **[HIGH] {row['title']}** "
+        f"(Risk {row['risk_score']}, Confidence {round(row['confidence'], 2)})"
+    )
+
+st.markdown("• Immediate prioritization recommended for high-risk + high-confidence items to mitigate validated exposure")
+
+
+# ── Charts ────────────────────────────────────────────────────────────────────
+st.header("Executive Intelligence Overview")
 
 st.subheader("1️⃣ Confidence-Weighted Risk Exposure")
-
 weighted_total = df_exec["weighted_risk"].sum()
 avg_weighted = df_exec["weighted_risk"].mean()
-
 col1, col2 = st.columns(2)
-
 with col1:
     st.metric("Total Weighted Risk Exposure", round(weighted_total, 2))
-
 with col2:
     st.metric("Average Weighted Risk per Insight", round(avg_weighted, 2))
 
-
 fig_weighted = px.bar(
     df_exec.sort_values("weighted_risk", ascending=False),
-    x="title",
-    y="weighted_risk",
-    color="category",
-    title="Risk Exposure per Insight (Risk × Confidence)"
+    x="title", y="weighted_risk", color="category",
+    title="Risk Exposure per Insight (Risk × Confidence)",
 )
-
 st.plotly_chart(fig_weighted, use_container_width=True)
 
 st.subheader("2️⃣ Risk–Confidence Priority Quadrant")
-
 median_risk = df_exec["risk_score"].median()
 median_conf = df_exec["confidence"].median()
-
 fig_quad = go.Figure()
-
 fig_quad.add_trace(
     go.Scatter(
         x=df_exec["confidence"],
         y=df_exec["risk_score"],
-        mode="markers+text",
-        text=df_exec["title"],
-        textposition="top center",
+        mode="markers",
         marker=dict(
-            size=df_exec["weighted_risk"] * 5,
+            size=df_exec["weighted_risk"] * 4,
             color=df_exec["weighted_risk"],
             colorscale="Reds",
             showscale=True,
-            colorbar=dict(title="Weighted Risk")
-        )
+            colorbar=dict(title="Weighted Risk"),
+            opacity=0.85,
+            line=dict(width=1, color="white"),
+        ),
+        hovertemplate=(
+            "<b>%{customdata}</b><br>"
+            "Risk: %{y}<br>"
+            "Confidence: %{x}<br>"
+            "Weighted Risk: %{marker.color:.2f}<extra></extra>"
+        ),
+        customdata=df_exec["title"],
     )
 )
-
-fig_quad.add_vline(x=median_conf, line_dash="dash")
-fig_quad.add_hline(y=median_risk, line_dash="dash")
-
-fig_quad.update_layout(
-    title="High Impact Zone = Top Right Quadrant",
-    xaxis_title="Confidence",
-    yaxis_title="Risk Score",
-    height=500
-)
-
+fig_quad.add_vline(x=median_conf, line_dash="dash", line_color="gray")
+fig_quad.add_hline(y=median_risk, line_dash="dash", line_color="gray")
+fig_quad.update_layout(title="High Impact Zone = Top Right Quadrant", xaxis_title="Confidence", yaxis_title="Risk Score", height=550)
+fig_quad.update_yaxes(range=[0.5, 5.5])
+fig_quad.update_xaxes(range=[0.6, 1.02])
 st.plotly_chart(fig_quad, use_container_width=True)
 
 st.subheader("3️⃣ Cumulative Risk Exposure Curve")
-
 sorted_df = df_exec.sort_values("weighted_risk", ascending=False).reset_index(drop=True)
 sorted_df["cumulative_exposure"] = sorted_df["weighted_risk"].cumsum()
-
 fig_curve = px.line(
-    sorted_df,
-    x=sorted_df.index + 1,
-    y="cumulative_exposure",
-    markers=True,
-    title="How Quickly Risk Concentrates Across Insights"
+    sorted_df, x=sorted_df.index + 1, y="cumulative_exposure",
+    markers=True, title="How Quickly Risk Concentrates Across Insights",
 )
-
-fig_curve.update_layout(
-    xaxis_title="Top N Insights",
-    yaxis_title="Cumulative Weighted Risk"
-)
-
+fig_curve.update_layout(xaxis_title="Top N Insights", yaxis_title="Cumulative Weighted Risk")
 st.plotly_chart(fig_curve, use_container_width=True)
 
 st.subheader("4️⃣ Risk Concentration by Category")
-
 category_risk = (
     df_exec.groupby("category")["weighted_risk"]
-    .sum()
-    .reset_index()
-    .sort_values("weighted_risk", ascending=False)
+    .sum().reset_index().sort_values("weighted_risk", ascending=False)
 )
-
-fig_cat = px.bar(
-    category_risk,
-    x="category",
-    y="weighted_risk",
-    title="Total Weighted Risk by Category"
-)
-
+fig_cat = px.bar(category_risk, x="category", y="weighted_risk", title="Total Weighted Risk by Category")
 st.plotly_chart(fig_cat, use_container_width=True)
 
-# ----------------------------
-# Triage queue + detail panel
-# ----------------------------
+
+# ── Triage queue + detail panel ───────────────────────────────────────────────
 st.subheader("🧰 Action Queue (Top items to triage today)")
+sel_row = None
 if total_insights:
     queue = df.copy().sort_values(["risk_score", "confidence", "created_at"], ascending=[False, False, False]).head(10)
     st.caption("Click an item below to see details and assign actions/owner/status.")
@@ -688,74 +673,112 @@ if total_insights:
     selected = st.radio("Top 10", labels, label_visibility="collapsed")
     sel_idx = labels.index(selected)
     sel_row = queue.iloc[sel_idx]
+else:
+    st.info("No items available under the current filters.")
 
-    left, right = st.columns([1.2, 0.8], gap="large")
-    with left:
+left, right = st.columns([1.2, 0.8], gap="large")
+
+with left:
+    if sel_row is None:
+        st.markdown("### No selected item")
+    else:
         st.markdown(f"### {sel_row['title']}")
-        st.write(sel_row.get("summary", ""))
+    st.write(sel_row.get("summary", ""))
 
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Risk", int(sel_row["risk_score"]))
-        a2.metric("Confidence", float(sel_row["confidence"]))
-        a3.metric("Band", risk_band(int(sel_row["risk_score"])))
+    if sel_row.get("url"):
+        st.markdown(
+            f"""
+            <div style="margin-top:8px; margin-bottom:16px;">
+                <a href="{sel_row['url']}" target="_blank"
+                   style="font-weight:600;font-size:15px;color:#1f6feb;text-decoration:none;">
+                   View Official Release ↗
+                </a>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        st.markdown("#### Recommended actions")
-        for act in (sel_row.get("recommended_actions") or []):
-            st.checkbox(str(act), value=False)
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Risk", int(sel_row["risk_score"]))
+    a2.metric("Confidence", float(sel_row["confidence"]))
+    a3.metric("Band", risk_band(int(sel_row["risk_score"])))
 
-        if enable_compare and diff_changed is not None and len(diff_changed):
-            key = stable_key(sel_row)
-            changed_hit = diff_changed.apply(lambda r: stable_key(r) == key, axis=1)
-            if changed_hit.any():
-                rowc = diff_changed[changed_hit].iloc[0]
-                st.markdown("#### What changed since previous snapshot")
-                st.write(f"- Risk: {rowc.get('old_risk_score')} → {rowc.get('risk_score')}{badge_delta(rowc.get('risk_score'), rowc.get('old_risk_score'), fmt='{:.0f}')}")
-                st.write(f"- Confidence: {rowc.get('old_confidence')} → {rowc.get('confidence')}{badge_delta(rowc.get('confidence'), rowc.get('old_confidence'), fmt='{:.2f}')}")
-                if str(rowc.get("old_summary")) != str(rowc.get("summary")):
-                    st.write("- Summary updated")
+    st.markdown("#### Recommended actions")
+    for act in (sel_row.get("recommended_actions") or []):
+        st.checkbox(str(act), value=False)
 
-        with st.expander("Raw record"):
-            st.json(sel_row.to_dict())
+    if enable_compare and diff_changed is not None and len(diff_changed):
+        key = stable_key(sel_row)
+        changed_hit = diff_changed.apply(lambda r: stable_key(r) == key, axis=1)
+        if changed_hit.any():
+            rowc = diff_changed[changed_hit].iloc[0]
+            st.markdown("#### What changed since previous snapshot")
+            st.write(
+                f"- Risk: {rowc.get('old_risk_score')} → {rowc.get('risk_score')}"
+                f"{badge_delta(rowc.get('risk_score'), rowc.get('old_risk_score'), fmt='{:.0f}')}"
+            )
+            st.write(
+                f"- Confidence: {rowc.get('old_confidence')} → {rowc.get('confidence')}"
+                f"{badge_delta(rowc.get('confidence'), rowc.get('old_confidence'), fmt='{:.2f}')}"
+            )
+            if str(rowc.get("old_summary")) != str(rowc.get("summary")):
+                st.write("- Summary updated")
 
-    with right:
-        st.markdown("### Triage")
-        k = stable_key(sel_row)
-        existing = st.session_state.triage.get(k, {})
-        owner = st.text_input("Owner", value=existing.get("owner", sel_row.get("owner", "")), key=f"owner_{k}")
-        status_options = ["New", "In review", "Mitigated", "Closed", "Won't fix"]
-        existing_status = existing.get("status", sel_row.get("status", "New"))
-        status = st.selectbox("Status", status_options, index=status_options.index(existing_status) if existing_status in status_options else 0, key=f"status_{k}")
-        due_date = st.text_input("Due date (YYYY-MM-DD)", value=existing.get("due_date", sel_row.get("due_date", "")), key=f"due_{k}")
-        notes = st.text_area("Notes", value=existing.get("notes", sel_row.get("notes", "")), height=140, key=f"notes_{k}")
+    with st.expander("Raw record"):
+        st.json(sel_row.to_dict())
 
-        if st.button("Save triage", type="primary"):
-            st.session_state.triage[k] = {"owner": owner, "status": status, "due_date": due_date, "notes": notes}
-            st.success("Saved.")
+with right:
+    st.markdown("### Triage")
+    k = stable_key(sel_row)
+    existing = st.session_state.triage.get(k, {})
+    owner = st.text_input("Owner", value=existing.get("owner", sel_row.get("owner", "")), key=f"owner_{k}")
+    status_options = ["New", "In review", "Mitigated", "Closed", "Won't fix"]
+    existing_status = existing.get("status", sel_row.get("status", "New"))
+    status = st.selectbox(
+        "Status", status_options,
+        index=status_options.index(existing_status) if existing_status in status_options else 0,
+        key=f"status_{k}",
+    )
+    due_date = st.text_input("Due date (YYYY-MM-DD)", value=existing.get("due_date", sel_row.get("due_date", "")), key=f"due_{k}")
+    notes = st.text_area("Notes", value=existing.get("notes", sel_row.get("notes", "")), height=140, key=f"notes_{k}")
 
-        st.markdown("---")
-        st.markdown("### Export")
-        st.download_button("Download current filtered CSV", data=df_to_csv_bytes(df), file_name="filtered_insights.csv", mime="text/csv")
+    if st.button("Save triage", type="primary"):
+        st.session_state.triage[k] = {"owner": owner, "status": status, "due_date": due_date, "notes": notes}
+        st.success("Saved.")
 
-# ----------------------------
-# High-risk table
-# ----------------------------
+    st.markdown("---")
+    st.markdown("### Export")
+    st.download_button("Download current filtered CSV", data=df_to_csv_bytes(df), file_name="filtered_insights.csv", mime="text/csv")
+
+
+# ── High-risk table ───────────────────────────────────────────────────────────
 st.subheader("📌 High-Risk Insight Breakdown (filtered)")
-top_risks = df[df["risk_score"] >= 4].copy().sort_values(by=["risk_score", "confidence", "created_at"], ascending=[False, False, False])
-
+top_risks = df[df["risk_score"] >= 4].copy().sort_values(
+    by=["risk_score", "confidence", "created_at"], ascending=[False, False, False]
+)
 if len(top_risks) == 0:
     st.info("No high-risk items under current filters.")
 else:
-    st.dataframe(top_risks[["title", "component", "kind", "risk_score", "confidence", "created_at", "status", "owner", "due_date"]], use_container_width=True)
+    display_cols = [
+        "title", "component", "kind", "source_name",
+        "risk_score", "confidence", "created_at", "status", "owner", "due_date"
+    ]
+    st.dataframe(
+        top_risks[[c for c in display_cols if c in top_risks.columns]],
+        use_container_width=True,
+    )
 
-# ----------------------------
-# RAG : Chatbot (Supabase-only, vector search)
-# ----------------------------
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RAG CHATBOT  –  Supabase-only, fingerprint-first routing
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("## Ask the assistant")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 
+# ── Embedding ─────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_embedder():
     from sentence_transformers import SentenceTransformer
@@ -776,6 +799,7 @@ def embed_query(text: str):
     return vec.tolist()
 
 
+# ── Small utilities ───────────────────────────────────────────────────────────
 def to_iso_str(x):
     try:
         ts = pd.to_datetime(x, errors="coerce")
@@ -797,7 +821,6 @@ def truncate_at_sentence(text: str, max_chars: int = 500) -> str:
     text = (text or "").replace("\n", " ").strip()
     if len(text) <= max_chars:
         return text
-
     truncated = text[:max_chars]
     for sep in [". ", "! ", "? "]:
         last = truncated.rfind(sep)
@@ -807,17 +830,6 @@ def truncate_at_sentence(text: str, max_chars: int = 500) -> str:
     if last_space != -1:
         return truncated[:last_space] + "."
     return truncated + "."
-
-
-def normalize_actions(actions):
-    if actions is None:
-        return []
-    if isinstance(actions, list):
-        return [str(a).strip() for a in actions if str(a).strip()]
-    if isinstance(actions, str):
-        parts = [p.strip() for p in actions.split("|")]
-        return [p for p in parts if p]
-    return []
 
 
 def build_structured_chunk_text(row: dict) -> str:
@@ -840,17 +852,38 @@ def build_structured_chunk_text(row: dict) -> str:
     return "\n".join(fields)
 
 
+# ── normalize_hit  (enriched fingerprint branch) ─────────────────────────────
 def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
     if source_type == "fingerprint_library_chunks":
+        # Prefer file-level identifiers for the display title
         title = (
-            row.get("chunk_title")
-            or row.get("file_name")
+            row.get("file_name")
             or row.get("file_path")
+            or row.get("chunk_title")
             or "Fingerprint Evidence"
         )
+        # Build a rich, file-oriented chunk text from all RPC-returned fields
+        parts = []
+        for label, key in [
+            ("File",        "file_name"),
+            ("Path",        "file_path"),
+            ("Module",      "module_name"),
+            ("Repo",        "repo_name"),
+            ("Category",    "category"),
+            ("Chunk Title", "chunk_title"),
+            ("Summary",     "chunk_summary"),
+            ("Code/Text",   "chunk_text"),
+        ]:
+            val = row.get(key, "")
+            if val:
+                parts.append(f"{label}: {val}")
+        chunk_text = "\n".join(parts) if parts else "No content available."
+
     elif source_type == "vector_chunks":
         raw_chunk = row.get("chunk_text", "") or ""
         title = raw_chunk[:80].replace("\n", " ").strip() or "Knowledge Chunk"
+        chunk_text = raw_chunk
+
     else:
         title = (
             row.get("title")
@@ -858,21 +891,18 @@ def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
             or row.get("name")
             or source_type
         )
+        chunk_text = (
+            row.get("chunk_text")
+            or row.get("chunk_summary")
+            or row.get("summary")
+            or row.get("recommendation_text")
+            or row.get("content")
+            or row.get("text")
+            or build_structured_chunk_text(row)
+        )
 
-    chunk_text = (
-        row.get("chunk_text")
-        or row.get("chunk_summary")
-        or row.get("summary")
-        or row.get("recommendation_text")
-        or row.get("content")
-        or row.get("text")
-        or build_structured_chunk_text(row)
-    )
-
-    risk_score = normalize_risk_score(
-        row.get("risk_score", row.get("final_risk_score"))
-    )
-    if pd.isna(risk_score) if isinstance(risk_score, float) else False:
+    risk_score = normalize_risk_score(row.get("risk_score", row.get("final_risk_score")))
+    if isinstance(risk_score, float) and pd.isna(risk_score):
         risk_score = 0
 
     confidence = normalize_confidence(row.get("confidence"))
@@ -882,26 +912,21 @@ def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
     raw_created_at = row.get("created_at")
     created_at_str = to_iso_str(raw_created_at) if raw_created_at else ""
 
-    source_id = (
-        row.get("source_id")
-        or row.get("file_id")
-        or row.get("id")
-        or ""
-    )
+    source_id = row.get("source_id") or row.get("file_id") or row.get("id") or ""
 
     return {
-        "source_type": source_type,
-        "title": title,
-        "chunk_text": str(chunk_text or ""),
-        "score": safe_similarity(
+        "source_type":    source_type,
+        "title":          title,
+        "chunk_text":     str(chunk_text or ""),
+        "score":          safe_similarity(
             similarity if similarity is not None
             else row.get("similarity", row.get("score", 0.0))
         ),
-        "risk_score": safe_int(risk_score, default=0),
-        "confidence": float(confidence) if confidence else 0.0,
-        "source_id": str(source_id),
-        "snapshot_id": row.get("snapshot_id", ""),
-        "kind": row.get("kind") or row.get("category") or source_type,
+        "risk_score":     safe_int(risk_score, default=0),
+        "confidence":     float(confidence) if confidence else 0.0,
+        "source_id":      str(source_id),
+        "snapshot_id":    row.get("snapshot_id", ""),
+        "kind":           row.get("kind") or row.get("category") or source_type,
         "component": (
             row.get("component")
             or row.get("module_name")
@@ -910,13 +935,14 @@ def normalize_hit(source_type: str, row: dict, similarity=None) -> dict:
             or row.get("file_name")
             or ""
         ),
-        "category": row.get("category") or source_type,
-        "created_at": created_at_str,
+        "category":       row.get("category") or source_type,
+        "created_at":     created_at_str,
         "has_created_at": bool(created_at_str),
-        "metadata": row,
+        "metadata":       row,
     }
 
 
+# ── Low-level RPC helper ──────────────────────────────────────────────────────
 def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
     sb = get_supabase()
     payload_options = [
@@ -928,7 +954,6 @@ def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
             "filter_kind": None,
         },
     ]
-
     last_err = None
     for payload in payload_options:
         try:
@@ -939,12 +964,12 @@ def vector_rpc_call(rpc_name: str, query_embedding: list, match_count: int):
         except Exception as e:
             last_err = e
             continue
-
     if last_err:
         raise last_err
     return []
 
 
+# ── Individual retrievers ─────────────────────────────────────────────────────
 def retrieve_vector_chunks(question: str, top_k: int = 5) -> list:
     query_embedding = embed_query(question)
     try:
@@ -952,7 +977,6 @@ def retrieve_vector_chunks(question: str, top_k: int = 5) -> list:
     except Exception as e:
         st.warning(f"Vector RPC failed: {e}")
         return []
-
     hits = []
     for r in rows:
         sim_score = safe_similarity(r.get("similarity", r.get("score", 0.0)))
@@ -971,7 +995,6 @@ def retrieve_fingerprint_chunks(question: str, top_k: int = 4) -> list:
     except Exception as e:
         st.warning(f"Fingerprint RPC failed: {e}")
         return []
-
     hits = []
     for r in rows:
         sim_score = safe_similarity(r.get("similarity", r.get("score", 0.0)))
@@ -987,10 +1010,10 @@ def retrieve_structured_supabase(question: str, top_k: int = 3) -> list:
     results = []
 
     table_specs = [
-        ("insights", "created_at"),
+        ("insights",        "created_at"),
         ("recommendations", "created_at"),
-        ("changes", "created_at"),
-        ("snapshots", "fetched_at"),
+        ("changes",         "created_at"),
+        ("snapshots",       "fetched_at"),
     ]
 
     for table_name, order_col in table_specs:
@@ -1022,15 +1045,8 @@ def retrieve_structured_supabase(question: str, top_k: int = 3) -> list:
                 str(r.get("file_name", "")),
             ]).lower()
 
-            overlap = sum(
-                1 for token in q.split()
-                if len(token) > 2 and token in blob
-            )
-
-            risk = safe_int(
-                normalize_risk_score(r.get("risk_score", r.get("final_risk_score"))),
-                default=0
-            )
+            overlap = sum(1 for token in q.split() if len(token) > 2 and token in blob)
+            risk = safe_int(normalize_risk_score(r.get("risk_score", r.get("final_risk_score"))), default=0)
 
             recency_boost = 0.0
             raw_ts = r.get("created_at") or r.get("fetched_at")
@@ -1057,27 +1073,45 @@ def retrieve_structured_supabase(question: str, top_k: int = 3) -> list:
             if final_score <= 0:
                 continue
             results.append(
-                normalize_hit(
-                    table_name,
-                    row,
-                    similarity=min(0.99, 0.35 + (0.1 * final_score))
-                )
+                normalize_hit(table_name, row, similarity=min(0.99, 0.35 + (0.1 * final_score)))
             )
-
     return results
 
 
-def query_needs_fingerprint_boost(question: str) -> bool:
+# ── Fingerprint query detector ────────────────────────────────────────────────
+# Any question that is clearly about code/files/providers routes fingerprint-first.
+FINGERPRINT_TERMS = {
+    "fingerprint", "fingerprinting",
+    "file", "files", "library", "chunk", "module",
+    "provider", "providers",
+    "code", "class", "classes", "method", "function",
+    "android id", "androidid", "gsf", "gsfid",
+    "mediadrm", "drm",
+    "deviceid", "device id", "device_id",
+    "signal", "identifier", "identifiers",
+    "repo", "repository",
+    "vulnerable file", "vulnerable class",
+    "which file", "which class",
+    "sdk fallback", "fallback signal",
+    "attestation", "emulator detection",
+}
+
+
+def is_fingerprint_query(question: str) -> bool:
     q = question.lower()
-    keywords = [
-        "android id", "androidid", "gsf", "mediadrm", "identifier", "device id",
-        "signal", "provider", "fingerprint", "sdk", "fallback", "os build",
-        "hardware signal", "installed apps", "attestation", "emulator", "tamper",
-    ]
-    return any(k in q for k in keywords)
+    for term in FINGERPRINT_TERMS:
+        if term in q:
+            return True
+    return False
 
 
-def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list:
+# ── Ranker (fingerprint_mode hard-suppresses structured sources) ──────────────
+def rank_and_dedup_results(
+    results: list,
+    question: str,
+    top_k: int = 8,
+    fingerprint_mode: bool = False,
+) -> list:
     if not results:
         return []
 
@@ -1090,8 +1124,8 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
             f"::{(hit.get('chunk_text') or '')[:200]}"
         )
 
-        semantic = safe_similarity(hit.get("score", 0.0))
-        risk = min(max(hit.get("risk_score", 0), 0), 5) / 5.0
+        semantic   = safe_similarity(hit.get("score", 0.0))
+        risk       = min(max(hit.get("risk_score", 0), 0), 5) / 5.0
         confidence = min(max(hit.get("confidence", 0.0), 0.0), 1.0)
 
         recency = 0.0
@@ -1111,28 +1145,37 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
             except Exception:
                 recency = 0.0
 
-        source_boost = {
+        base_source_boost = {
             "fingerprint_library_chunks": 0.10,
-            "vector_chunks": 0.08,
-            "recommendations": 0.08,
-            "insights": 0.06,
-            "changes": 0.05,
-            "snapshots": 0.04,
+            "vector_chunks":              0.08,
+            "recommendations":            0.08,
+            "insights":                   0.06,
+            "changes":                    0.05,
+            "snapshots":                  0.04,
         }.get(hit.get("source_type"), 0.02)
 
-        if query_needs_fingerprint_boost(question) and hit.get("source_type") == "fingerprint_library_chunks":
-            source_boost += 0.10
-
-        if any(term in q for term in ["priority", "triage", "action", "recommendation"]) \
-           and hit.get("source_type") == "recommendations":
-            source_boost += 0.06
+        if fingerprint_mode:
+            # Hard-suppress structured risk sources so they cannot outrank fp chunks
+            if hit.get("source_type") in ("recommendations", "insights", "changes", "snapshots"):
+                base_source_boost = -0.30
+            if hit.get("source_type") == "fingerprint_library_chunks":
+                base_source_boost = 0.30
+        else:
+            # Legacy heuristic boosts for general queries
+            if is_fingerprint_query(question) and hit.get("source_type") == "fingerprint_library_chunks":
+                base_source_boost += 0.10
+            if (
+                any(t in q for t in ["priority", "triage", "action", "recommendation"])
+                and hit.get("source_type") == "recommendations"
+            ):
+                base_source_boost += 0.06
 
         final_score = (
             0.50 * semantic
             + 0.15 * risk
             + 0.10 * confidence
             + 0.15 * recency
-            + source_boost
+            + base_source_boost
         )
         hit["final_rank_score"] = round(final_score, 4)
 
@@ -1140,52 +1183,57 @@ def rank_and_dedup_results(results: list, question: str, top_k: int = 8) -> list
         if prev is None or hit["final_rank_score"] > prev["final_rank_score"]:
             deduped[key] = hit
 
-    ranked = sorted(
-        deduped.values(),
-        key=lambda x: x.get("final_rank_score", 0.0),
-        reverse=True
-    )
+    ranked = sorted(deduped.values(), key=lambda x: x.get("final_rank_score", 0.0), reverse=True)
     return ranked[:top_k]
 
 
+# ── Top-level multisource retrieval  (fingerprint-first routing) ──────────────
 def retrieve_multisource_context(question: str, top_k: int = 8) -> list:
-    results = []
-    vector_hits = retrieve_vector_chunks(question, top_k=max(4, top_k))
-    fingerprint_hits = retrieve_fingerprint_chunks(question, top_k=max(3, top_k // 2))
-    structured_hits = retrieve_structured_supabase(question, top_k=RAG_STRUCTURED_TOP_K)
+    if is_fingerprint_query(question):
+        # FINGERPRINT-FIRST PATH: structured risk tables are not called at all
+        fp_hits = retrieve_fingerprint_chunks(question, top_k=max(top_k, 10))
 
-    results.extend(vector_hits)
-    results.extend(fingerprint_hits)
-    results.extend(structured_hits)
+        if fp_hits:
+            # Optionally supplement with generic vector chunks only
+            vec_hits = retrieve_vector_chunks(question, top_k=max(3, top_k // 3))
+            combined = fp_hits + vec_hits
+            return rank_and_dedup_results(combined, question, top_k=top_k, fingerprint_mode=True)
+        else:
+            # Nothing in fingerprint library matched - warn and fall back fully
+            st.warning(
+                "No fingerprint library chunks matched this query. "
+                "Falling back to general retrieval."
+            )
+            results = retrieve_vector_chunks(question, top_k=max(4, top_k))
+            results += retrieve_structured_supabase(question, top_k=RAG_STRUCTURED_TOP_K)
+            return rank_and_dedup_results(results, question, top_k=top_k)
+    else:
+        # GENERAL PATH: mixed retrieval, unchanged behaviour
+        results = []
+        results += retrieve_vector_chunks(question, top_k=max(4, top_k))
+        results += retrieve_fingerprint_chunks(question, top_k=max(3, top_k // 2))
+        results += retrieve_structured_supabase(question, top_k=RAG_STRUCTURED_TOP_K)
+        return rank_and_dedup_results(results, question, top_k=top_k)
 
-    return rank_and_dedup_results(results, question, top_k=top_k)
 
-
+# ── Evidence formatting ───────────────────────────────────────────────────────
 def build_evidence_context(evidence: list, max_items: int = 5, max_chars: int = 500) -> str:
     context_blocks = []
     for i, ev in enumerate(evidence[:max_items], start=1):
-        title = ev.get("title", "Untitled")
-        source_type = ev.get("source_type", "unknown")
-        risk_score = ev.get("risk_score", 0)
-        confidence = ev.get("confidence", 0.0)
         excerpt = truncate_at_sentence(ev.get("chunk_text", ""), max_chars=max_chars)
-
-        context_blocks.append(
-            "\n".join([
-                f"Source {i}",
-                f"Title: {title}",
-                f"Source Type: {source_type}",
-                f"Risk Score: {risk_score}",
-                f"Confidence: {confidence}",
-                f"Excerpt: {excerpt}",
-            ])
-        )
+        context_blocks.append("\n".join([
+            f"Source {i}",
+            f"Title: {ev.get('title', 'Untitled')}",
+            f"Source Type: {ev.get('source_type', 'unknown')}",
+            f"Risk Score: {ev.get('risk_score', 0)}",
+            f"Confidence: {ev.get('confidence', 0.0)}",
+            f"Excerpt: {excerpt}",
+        ]))
     return "\n\n".join(context_blocks)
 
 
 def classify_question_type(question: str) -> str:
     q = question.lower().strip()
-
     if any(phrase in q for phrase in ["how many", "count", "number of"]):
         return "count"
     if any(phrase in q for phrase in ["what changed", "new changes", "recent changes", "since the last update"]):
@@ -1196,25 +1244,19 @@ def classify_question_type(question: str) -> str:
         return "why"
     if any(term in q for term in ["top", "highest", "priority", "triage", "most important risks"]):
         return "top_risks"
-
     return "general"
 
 
-# ---------------------------------------
-# LLM call
-# ---------------------------------------
+# ── LLM call ──────────────────────────────────────────────────────────────────
 from src.llm_client import get_llm_client, chat_json
+
 
 def call_llm(prompt: str) -> str:
     client = get_llm_client()
-
     result = chat_json(
         client=client,
-        model="gemma-2-9b-it",
-        system=(
-            "You are a security risk analyst. "
-            "Return valid JSON with a single key: answer."
-        ),
+        model="google/gemma-4-31b-it",
+        system="You are a security risk analyst. Return valid JSON with a single key: answer.",
         user=(
             "Answer the user's question using the provided context. "
             "Be concise, natural, and human-readable.\n\n"
@@ -1224,13 +1266,12 @@ def call_llm(prompt: str) -> str:
         temperature=0.3,
         max_tokens=400,
     )
-
     return (result.get("answer") or "").strip()
+
 
 def generate_natural_answer(question: str, evidence: list) -> str:
     question_type = classify_question_type(question)
     context = build_evidence_context(evidence, max_items=5, max_chars=500)
-    
     prompt = f"""
 You are a sharp security risk analyst.
 
@@ -1252,12 +1293,11 @@ Rules:
 
 Structure:
 1. First sentence: clear answer
-2. 1–2 sentences: why it matters (impact)
+2. 1-2 sentences: why it matters (impact)
 3. Final sentence: "Bottom line: ..."
 
 Do not list items unless necessary.
 """
-
     return call_llm(prompt).strip()
 
 
@@ -1268,16 +1308,12 @@ def count_from_supabase(question: str) -> dict:
 
     table_keyword_map = {
         "recommendations": ["recommendation", "action item", "action"],
-        "insights": ["insight", "finding"],
-        "changes": ["change", "diff"],
-        "snapshots": ["snapshot"],
+        "insights":        ["insight", "finding"],
+        "changes":         ["change", "diff"],
+        "snapshots":       ["snapshot"],
     }
 
-    tables_to_count = []
-    for table, keywords in table_keyword_map.items():
-        if any(kw in q for kw in keywords):
-            tables_to_count.append(table)
-
+    tables_to_count = [t for t, kws in table_keyword_map.items() if any(kw in q for kw in kws)]
     if not tables_to_count:
         tables_to_count = list(table_keyword_map.keys())
 
@@ -1290,17 +1326,8 @@ def count_from_supabase(question: str) -> dict:
 
     parts = [f"- {k}: **{v}**" for k, v in count_results.items()]
     total = sum(v for v in count_results.values() if isinstance(v, int))
-
-    answer = (
-        "Exact counts from Supabase:\n\n"
-        + "\n".join(parts)
-        + f"\n\n**Total: {total}**"
-    )
-
-    return {
-        "answer": answer,
-        "confidence": 0.95,
-    }
+    answer = "Exact counts from Supabase:\n\n" + "\n".join(parts) + f"\n\n**Total: {total}**"
+    return {"answer": answer, "confidence": 0.95}
 
 
 def answer_from_supabase_rag(question: str, top_k: int = 8) -> dict:
@@ -1313,15 +1340,9 @@ def answer_from_supabase_rag(question: str, top_k: int = 8) -> dict:
             "evidence": [],
         }
 
-    question_type = classify_question_type(question)
-
-    if question_type == "count":
+    if classify_question_type(question) == "count":
         count_result = count_from_supabase(question)
-        return {
-            "answer": count_result["answer"],
-            "confidence": count_result["confidence"],
-            "evidence": evidence,
-        }
+        return {"answer": count_result["answer"], "confidence": count_result["confidence"], "evidence": evidence}
 
     try:
         answer = generate_natural_answer(question, evidence)
@@ -1336,23 +1357,16 @@ def answer_from_supabase_rag(question: str, top_k: int = 8) -> dict:
         )
 
     conf = round(min(0.95, max(0.40, evidence[0].get("final_rank_score", 0.0))), 2)
-
-    return {
-        "answer": answer,
-        "confidence": conf,
-        "evidence": evidence,
-    }
+    return {"answer": answer, "confidence": conf, "evidence": evidence}
 
 
+# ── Chat UI ───────────────────────────────────────────────────────────────────
 question = st.text_input("Ask a question about risk insights, changes, or signals")
 
 if st.button("Ask") and question.strip():
     with st.spinner("Retrieving from Supabase and ranking evidence..."):
         result = answer_from_supabase_rag(question, top_k=RAG_TOP_K)
-        st.session_state.chat_history.append({
-            "question": question,
-            "result": result,
-        })
+        st.session_state.chat_history.append({"question": question, "result": result})
 
 for item in reversed(st.session_state.chat_history):
     st.markdown(f"### Q: {item['question']}")
@@ -1374,18 +1388,16 @@ for item in reversed(st.session_state.chat_history):
                     f"score={round(ev.get('final_rank_score', ev.get('score', 0.0)), 3)}"
                 )
                 st.write(ev.get("chunk_text", "")[:1500])
-
-                meta = {
-                    "source_type": ev.get("source_type"),
-                    "source_id": ev.get("source_id"),
-                    "snapshot_id": ev.get("snapshot_id"),
-                    "kind": ev.get("kind"),
-                    "risk_score": ev.get("risk_score"),
-                    "component": ev.get("component"),
-                    "category": ev.get("category"),
-                    "score": ev.get("score"),
+                st.json({
+                    "source_type":      ev.get("source_type"),
+                    "source_id":        ev.get("source_id"),
+                    "snapshot_id":      ev.get("snapshot_id"),
+                    "kind":             ev.get("kind"),
+                    "risk_score":       ev.get("risk_score"),
+                    "component":        ev.get("component"),
+                    "category":         ev.get("category"),
+                    "score":            ev.get("score"),
                     "final_rank_score": ev.get("final_rank_score"),
-                    "created_at": ev.get("created_at"),
-                    "has_created_at": ev.get("has_created_at"),
-                }
-                st.json(meta)
+                    "created_at":       ev.get("created_at"),
+                    "has_created_at":   ev.get("has_created_at"),
+                })
